@@ -317,7 +317,12 @@ function _waRowRoot(row) {
 }
 function _waElText(el) {
     if (!el) return '';
-    return (el.innerText || el.textContent || '').trim();
+    var text = (el.innerText || el.textContent || '').trim();
+    if (text) return text;
+    if (el.tagName === 'IMG') {
+        return (el.getAttribute('data-plain-text') || el.getAttribute('alt') || '').trim();
+    }
+    return '';
 }
 function _waIsBodyTextEl(el, quoteBlock) {
     if (!el) return false;
@@ -383,7 +388,9 @@ function _waLooksLikeIconLigature(s) {
     s = (s || '').trim();
     if (!s) return true;
     if (s.indexOf('wds-ic-') === 0 || s.indexOf('wds-icon') === 0) return true;
-    return !/\s/.test(s) && /^[a-z0-9_-]+$/.test(s) && s.length > 3;
+    // Hyphenated icon tokens only — plain words like "hello" are real text.
+    if (/\s/.test(s) || !/^[a-z0-9_-]+$/.test(s)) return false;
+    return s.indexOf('-') >= 0 && s.length > 3;
 }
 function _waParsePrePlain(row) {
     var el = row.querySelector('[data-pre-plain-text]');
@@ -560,7 +567,7 @@ function _waExtractTime(container) {
 _JS_PARSE_MESSAGE = (
     _JS_HELPERS
     + r"""
-(function(row) {
+return (function(row) {
     var SKIP = """
     + _JS_SKIP_ZONES
     + r""";
@@ -593,7 +600,7 @@ _JS_PARSE_MESSAGE = (
 _JS_MSG_TEXT = (
     _JS_HELPERS
     + r"""
-(function(row) {
+return (function(row) {
     var SKIP = """
     + _JS_SKIP_ZONES
     + r""";
@@ -608,7 +615,7 @@ _JS_MSG_TEXT = (
 _JS_QUOTE_PARSE = (
     _JS_HELPERS
     + r"""
-(function(row) {
+return (function(row) {
     var block = _waFindQuoteBlock(row);
     if (!block) return null;
     return _waExtractQuote(block);
@@ -619,7 +626,7 @@ _JS_QUOTE_PARSE = (
 _JS_SENDER = (
     _JS_HELPERS
     + r"""
-(function(row) {
+return (function(row) {
     var container = _waMsgRoot(row);
     var isOut = _waIsOutgoing(row);
     var quoteBlock = _waFindQuoteBlock(row);
@@ -631,7 +638,7 @@ _JS_SENDER = (
 _JS_REACTIONS = (
     _JS_HELPERS
     + r"""
-(function(row) {
+return (function(row) {
     var results = [];
     var seen = {};
 
@@ -705,7 +712,7 @@ _JS_REACTIONS = (
 )
 
 _JS_COLLECT_REACTORS = r"""
-(function(dialog) {
+return (function(dialog) {
     var names = [];
     var seen = {};
     function collect(root) {
@@ -883,26 +890,29 @@ def _extract_text(driver, row_el) -> str:
         return str(dom["text"]).strip()
     try:
         result = driver.execute_script(_JS_MSG_TEXT, row_el)
-        return (result or "").strip()
+        if result:
+            return str(result).strip()
     except Exception:
-        container = find(row_el, '[data-testid="msg-container"]') or row_el
-        quote_block = _find_quote_block(row_el)
-        parts = []
-        for sp in find_all(container, S["msg_text"]):
-            try:
-                if quote_block:
-                    inside = driver.execute_script(
-                        "return arguments[0] && arguments[0].contains(arguments[1]);",
-                        quote_block, sp,
-                    )
-                    if inside:
-                        continue
-            except Exception:
-                pass
-            t = sp.text.strip()
-            if t:
-                parts.append(t)
-        return "\n".join(parts).strip()
+        pass
+
+    container = find(row_el, '[data-testid="msg-container"]') or row_el
+    quote_block = _find_quote_block(row_el)
+    parts = []
+    for sp in find_all(container, S["msg_text"]):
+        try:
+            if quote_block:
+                inside = driver.execute_script(
+                    "return arguments[0] && arguments[0].contains(arguments[1]);",
+                    quote_block, sp,
+                )
+                if inside:
+                    continue
+        except Exception:
+            pass
+        t = sp.text.strip()
+        if t:
+            parts.append(t)
+    return "\n".join(parts).strip()
 
 
 def _extract_sender(driver, row_el, is_out: bool) -> str:
