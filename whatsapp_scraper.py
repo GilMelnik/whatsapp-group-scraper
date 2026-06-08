@@ -177,32 +177,39 @@ S: Dict[str, str] = {
     # ── message panel ──────────────────────────────────────────────────────────
     "panel":         '[data-testid="conversation-panel-messages"]',
     "date_card":     '[data-testid="msg-dateseparator"]',
-    "message_row":   'div[data-id]',
+    "message_row":   '[data-testid="msg-container"]',
     "loading_spin":  '[data-testid="conv-loadingmsg"]',   # while older msgs load
 
     # ── per-message elements ───────────────────────────────────────────────────
-    "author":        '[data-testid="author"]',
-    # Direct-child (>) is essential: descendant ( ) would double-count nested
-    # span[dir] elements that WhatsApp inserts for mixed Hebrew/English text.
-    "msg_text":      '[data-testid="selectable-text"], span.copyable-text',
-    "msg_meta":      '[data-testid="msg-meta"]',           # time + tick icons
+    # WhatsApp uses testid="author" (non-standard) as well as data-testid="author"
+    "author":        '[data-testid="author"], [testid="author"]',
+    "msg_text":      '[data-testid="selectable-text"]:not(.quoted-mention), span.copyable-text:not(.quoted-mention)',
+    "msg_meta":      '[data-testid="msg-meta"]',
     "tail_out":      '[data-testid="tail-out"]',
+    "tail_in":       '[data-testid="tail-in"]',
 
     # ── quoted / replied-to preview ────────────────────────────────────────────
-    "quote_block":   '[data-testid="quoted-message"]',
-    "quote_author":  '[data-testid="quoted-mention"]',
+    "quote_block":   '[data-testid="quoted-message"], [data-testid="quoted-msg"]',
+    "quote_author":  '[data-testid="quoted-author"], [testid="author"], [data-testid="author"]',
+    "quote_text":    '[data-testid="selectable-text"].quoted-mention, .quoted-mention',
 
     # ── emoji reactions ────────────────────────────────────────────────────────
     "rxn_container": (
+        '[data-testid="addon-bubble-container"],'
         '[data-testid="reactions-read-more-container"],'
         '[data-testid="reactions-container"],'
-        '[data-testid="msg-reactions"],'
-        '[data-testid*="reactions"]'
+        '[data-testid="msg-reactions"]'
     ),
-    # Dialog that opens when you click a reaction pill
     "rxn_dialog":    '[data-testid="reactions-list"]',
     "rxn_tab":       '[data-testid="reactions-tab"]',
     "rxn_name":      '[data-testid="react-participant"]',
+    "rxn_pill":      (
+        '[data-testid="reaction-bubble"],'
+        '[data-testid="reactions-bubble"] [role="button"],'
+        '[data-testid="reactions-container"] [role="button"],'
+        '[data-testid="msg-reactions"] [role="button"]'
+    ),
+    "rxn_scroll":    '[data-testid="scrollable-content"], [data-scrolltraceid]',
 
     # ── media type indicators ──────────────────────────────────────────────────
     "m_image":    '[data-testid="image-thumb"],[data-testid="media-url-provider"]',
@@ -260,47 +267,38 @@ _HE_MONTHS: Dict[str, int] = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  JavaScript text-extraction snippets
+#  JavaScript DOM extraction
 #
-#  Why JavaScript instead of Selenium CSS queries?
+#  WhatsApp Web renders each message as a tree of separate divs:
+#    msg-container → author | quoted-message | body text | msg-meta | reactions
 #
-#  WhatsApp wraps every message in   span.selectable-text > span[dir="ltr"|"rtl"]
-#  For a purely Hebrew message that is one span.  For mixed Hebrew+English
-#  WhatsApp nests a second span[dir] inside the first:
-#
-#      <span dir="rtl">                       ← outer, covers whole message
-#          שלום
-#          <span dir="ltr">world</span>       ← inner, wraps only the LTR word
-#          שלום
-#      </span>
-#
-#  A CSS descendant selector ( ) matches BOTH spans, so Selenium's find_all
-#  returns ["שלום world שלום", "world"] — the English word is duplicated.
-#  A direct-child selector (>) matches only the outer span whose .innerText
-#  already includes the nested English text → correct single result.
-#
-#  The JS snippets additionally exclude the quoted-message block, reactions,
-#  and the timestamp meta-span, which all contain their own span[dir] nodes.
+#  Each field is read ONLY from its own zone — never by parsing combined
+#  innerText of the whole row.  Class-name selectors are avoided (they change
+#  every release); data-testid attributes are used wherever possible.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Shared skip-list for zones that must never contribute to message body text.
+# Zones whose text must never bleed into the message body.
+# Note: author selectors are intentionally omitted here — the message author
+# often wraps or sits near the body zone; excluding [testid="author"]
+# ancestors was causing every body to come back empty.
 _JS_SKIP_ZONES = r"""[
     '[data-testid="quoted-message"]',
     '[data-testid="quoted-msg"]',
-    '[class*="quoted-message"]',
-    '[class*="quoted-mention"]',
+    '[data-testid="addon-bubble-container"]',
+    '[data-testid="reaction-bubble"]',
     '[data-testid="reactions-read-more-container"]',
     '[data-testid="reactions-container"]',
     '[data-testid="msg-reactions"]',
-    '[data-testid*="reactions"]',
+    '[data-testid="reactions-bubble"]',
+    '[data-testid="reactions-list"]',
     '[data-testid="msg-meta"]',
-    '[data-testid="author"]',
     '[data-testid="image-thumb"]',
     '[data-testid="video-thumb"]',
     '[data-testid="audio-player"]',
     '[data-testid="sticker-media"]',
     '[data-testid="document-thumb"]',
     '[data-testid="location-map"]',
+    '.quoted-mention',
     '.wds-icon'
 ]"""
 
@@ -309,6 +307,68 @@ function _waInside(el, selectors) {
     for (var i = 0; i < selectors.length; i++) {
         if (el.closest(selectors[i])) return true;
     }
+    return false;
+}
+function _waMsgRoot(row) {
+    return row.querySelector('[data-testid="msg-container"]') || row;
+}
+function _waRowRoot(row) {
+    return row.closest('.focusable-list-item') || row;
+}
+function _waElText(el) {
+    if (!el) return '';
+    return (el.innerText || el.textContent || '').trim();
+}
+function _waIsBodyTextEl(el, quoteBlock) {
+    if (!el) return false;
+    if (quoteBlock && quoteBlock.contains(el)) return false;
+    if (_waIsQuotedMention(el)) return false;
+    if (el.getAttribute('testid') === 'author') return false;
+    if (el.closest('[testid="author"], [data-testid="author"], [data-testid="quoted-author"]')) return false;
+    return true;
+}
+function _waExtractBodyAfterQuote(quoteBlock) {
+    if (!quoteBlock) return '';
+    var anchor = quoteBlock;
+    for (var depth = 0; depth < 8 && anchor; depth++) {
+        var sib = anchor.nextElementSibling;
+        while (sib) {
+            var st = sib.querySelector('[data-testid="selectable-text"]');
+            if (st && _waIsBodyTextEl(st, quoteBlock)) {
+                var t = _waElText(st);
+                if (_waTextOk(t)) return t;
+            }
+            var raw = _waElText(sib);
+            if (_waTextOk(raw)) return raw;
+            sib = sib.nextElementSibling;
+        }
+        if (anchor.parentElement === anchor) break;
+        anchor = anchor.parentElement;
+    }
+    return '';
+}
+function _waExtractBodyFromAkbu(container, quoteBlock) {
+    var zones = container.querySelectorAll('div._akbu, [class*="_akbu"]');
+    for (var i = 0; i < zones.length; i++) {
+        var zone = zones[i];
+        if (quoteBlock && quoteBlock.contains(zone)) continue;
+        var st = zone.querySelector('[data-testid="selectable-text"]');
+        if (st && _waIsBodyTextEl(st, quoteBlock)) {
+            var t = _waElText(st);
+            if (_waTextOk(t)) return t;
+        }
+        var raw = _waElText(zone);
+        if (_waTextOk(raw)) return raw;
+    }
+    return '';
+}
+function _waIsOutgoing(row) {
+    var dataId = row.getAttribute('data-id') || '';
+    if (dataId.indexOf('true_') === 0) return true;
+    if (row.querySelector('[data-testid="tail-out"]')) return true;
+    if (row.classList.contains('message-out')) return true;
+    if (row.querySelector('.message-out')) return true;
+    if (row.closest('.message-out')) return true;
     return false;
 }
 function _waLooksLikeTimestamp(s) {
@@ -325,17 +385,6 @@ function _waLooksLikeIconLigature(s) {
     if (s.indexOf('wds-ic-') === 0 || s.indexOf('wds-icon') === 0) return true;
     return !/\s/.test(s) && /^[a-z0-9_-]+$/.test(s) && s.length > 3;
 }
-function _waStripPrePrefix(text) {
-    var t = (text || '').trim();
-    var open = t.indexOf('[');
-    if (open !== 0) return t;
-    var close = t.indexOf(']');
-    if (close < 0) return t;
-    var rest = t.slice(close + 1).trim();
-    var colon = rest.indexOf(':');
-    if (colon < 0) return t;
-    return rest.slice(colon + 1).trim();
-}
 function _waParsePrePlain(row) {
     var el = row.querySelector('[data-pre-plain-text]');
     if (!el) return null;
@@ -345,50 +394,201 @@ function _waParsePrePlain(row) {
     return { time: m[1].trim(), sender: m[2].trim() };
 }
 function _waFindQuoteBlock(row) {
-    return row.querySelector('[data-testid="quoted-message"]')
-        || row.querySelector('[data-testid="quoted-msg"]')
-        || row.querySelector('[class*="quoted-message"]');
+    var root = _waMsgRoot(row);
+    return root.querySelector('[data-testid="quoted-message"]')
+        || root.querySelector('[data-testid="quoted-msg"]');
 }
-function _waLooksLikeSender(s) {
+function _waTextOk(s) {
     s = (s || '').trim();
-    if (!s) return false;
-    if (s.length > 48) return false;
-    if (/^https?:\/\//i.test(s)) return false;
-    if (/^\+?[\d\s\-().@]+$/.test(s)) return true;
-    if (s.indexOf('@+') === 0) return true;
-    if ((s.match(/[.!?]/g) || []).length > 1) return false;
-    if (s.length > 28 && (s.indexOf('?') >= 0 || s.indexOf('!') >= 0)) return false;
-    return s.length <= 32;
+    return s && !_waLooksLikeTimestamp(s) && !_waLooksLikeStatusGlyph(s) && !_waLooksLikeIconLigature(s);
 }
-function _waCollectBodyTexts(root, quoteBlock, skip) {
-    var results = [];
-    var els = root.querySelectorAll(
-        '[data-testid="selectable-text"], span.selectable-text, span.copyable-text,' +
-        '[data-testid="conversation-text"], span[dir], div[dir]'
-    );
-    for (var i = 0; i < els.length; i++) {
-        var el = els[i];
-        if (quoteBlock && quoteBlock.contains(el)) continue;
-        if (_waInside(el, skip)) continue;
-        var txt = (el.innerText || '').trim();
-        if (!txt || _waLooksLikeTimestamp(txt) || _waLooksLikeStatusGlyph(txt) || _waLooksLikeIconLigature(txt)) continue;
-        results.push({ el: el, txt: txt });
-    }
-    // Drop nested duplicates — keep outermost span only.
+function _waDedupeNested(items) {
     var outer = [];
-    for (var a = 0; a < results.length; a++) {
+    for (var a = 0; a < items.length; a++) {
         var nested = false;
-        for (var b = 0; b < results.length; b++) {
-            if (a !== b && results[b].el !== results[a].el && results[b].el.contains(results[a].el)) {
+        for (var b = 0; b < items.length; b++) {
+            if (a !== b && items[b].el !== items[a].el && items[b].el.contains(items[a].el)) {
                 nested = true;
                 break;
             }
         }
-        if (!nested) outer.push(results[a].txt);
+        if (!nested) outer.push(items[a].txt);
     }
     return outer;
 }
+function _waCollectTextNodes(root, skip, excludeEl) {
+    var parts = [];
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    var n;
+    while ((n = walker.nextNode())) {
+        var parent = n.parentElement;
+        if (!parent) continue;
+        if (excludeEl && excludeEl.contains(parent)) continue;
+        if (_waInside(parent, skip)) continue;
+        if (parent.closest('.wds-icon')) continue;
+        var raw = (n.textContent || '').trim();
+        if (!_waTextOk(raw)) continue;
+        parts.push(raw);
+    }
+    return parts.join(' ').trim();
+}
+function _waIsQuotedMention(el) {
+    return el && el.classList && el.classList.contains('quoted-mention');
+}
+function _waFindMsgAuthor(container, quoteBlock) {
+    var els = container.querySelectorAll('[data-testid="author"], [testid="author"]');
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (quoteBlock && quoteBlock.contains(el)) continue;
+        var t = (el.innerText || '').trim();
+        if (t) return t;
+    }
+    return '';
+}
+function _waFindQuoteAuthor(block) {
+    var el = block.querySelector('[data-testid="quoted-author"]')
+        || block.querySelector('[testid="author"]')
+        || block.querySelector('[data-testid="author"]');
+    return el ? (el.innerText || '').trim() : '';
+}
+function _waCollectBodyElements(root, quoteBlock, skip) {
+    var results = [];
+    var els = root.querySelectorAll('[data-testid="selectable-text"]');
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (!_waIsBodyTextEl(el, quoteBlock)) continue;
+        if (_waInside(el, skip)) continue;
+        var txt = _waElText(el);
+        if (!_waTextOk(txt)) continue;
+        results.push({ el: el, txt: txt });
+    }
+    if (results.length) return _waDedupeNested(results);
+
+    els = root.querySelectorAll(
+        '[data-testid="conversation-text"], span.selectable-text, span.copyable-text, span[dir], div[dir]'
+    );
+    for (var j = 0; j < els.length; j++) {
+        el = els[j];
+        if (!_waIsBodyTextEl(el, quoteBlock)) continue;
+        if (_waInside(el, skip)) continue;
+        txt = _waElText(el);
+        if (!_waTextOk(txt)) continue;
+        results.push({ el: el, txt: txt });
+    }
+    return _waDedupeNested(results);
+}
+function _waExtractQuote(block) {
+    var sender = _waFindQuoteAuthor(block);
+    var text = '';
+
+    var textEl = block.querySelector('[data-testid="selectable-text"].quoted-mention')
+        || block.querySelector('.quoted-mention[data-testid="selectable-text"]')
+        || block.querySelector('.quoted-mention');
+    if (textEl) text = _waElText(textEl);
+
+    if (!text) {
+        var els = block.querySelectorAll('[data-testid="selectable-text"]');
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (el.getAttribute('testid') === 'author') continue;
+            if (el.closest('[testid="author"], [data-testid="author"], [data-testid="quoted-author"]')) continue;
+            var t = _waElText(el);
+            if (_waTextOk(t) && t !== sender) { text = t; break; }
+        }
+    }
+
+    if (!text) {
+        text = _waElText(block);
+        if (sender && text.indexOf(sender) === 0) {
+            text = text.slice(sender.length).trim();
+        }
+    }
+    if (!sender && !text) return null;
+    return { sender: sender, text: text };
+}
+function _waExtractBody(container, quoteBlock, authorEl, skip) {
+    // 1 — WhatsApp body wrapper (div._akbu) sitting beside the quote preview
+    var fromAkbu = _waExtractBodyFromAkbu(container, quoteBlock);
+    if (fromAkbu) return fromAkbu;
+
+    // 2 — sibling walk upward from quoted-message (quote wrapper → div._akbu)
+    if (quoteBlock) {
+        var fromSibling = _waExtractBodyAfterQuote(quoteBlock);
+        if (fromSibling) return fromSibling;
+    }
+
+    // 3 — any selectable-text outside the quote block (not .quoted-mention)
+    var parts = _waCollectBodyElements(container, quoteBlock, skip);
+    if (parts.length) return parts.join('\n');
+
+    // 4 — text nodes inside copyable wrapper, excluding quote subtree
+    var copyables = container.querySelectorAll('[data-pre-plain-text], .copyable-text');
+    for (var c = 0; c < copyables.length; c++) {
+        var copy = copyables[c];
+        if (_waInside(copy, skip)) continue;
+        if (quoteBlock && quoteBlock.contains(copy)) continue;
+        var fromCopy = _waCollectTextNodes(copy, skip, quoteBlock);
+        if (fromCopy) return fromCopy;
+    }
+
+    // 5 — walk msg-container text nodes, skip quote/meta/reactions
+    var fromRoot = _waCollectTextNodes(container, skip, quoteBlock);
+    if (fromRoot) return fromRoot;
+
+    return '';
+}
+function _waExtractSender(row, container, isOut, quoteBlock) {
+    if (isOut) return 'You';
+
+    var sender = _waFindMsgAuthor(container, quoteBlock);
+    if (sender) return sender;
+
+    var pre = _waParsePrePlain(row);
+    if (pre && pre.sender) return pre.sender;
+
+    return '';
+}
+function _waExtractTime(container) {
+    var meta = container.querySelector('[data-testid="msg-meta"]');
+    if (!meta) return '';
+    var raw = (meta.innerText || meta.textContent || '').trim();
+    var m = raw.match(/\d{1,2}:\d{2}(?:\s?[AaPp][Mm])?/);
+    return m ? m[0] : raw.split(/\s+/).pop();
+}
 """
+
+_JS_PARSE_MESSAGE = (
+    _JS_HELPERS
+    + r"""
+(function(row) {
+    var SKIP = """
+    + _JS_SKIP_ZONES
+    + r""";
+    var container = _waMsgRoot(row);
+    var isOut = _waIsOutgoing(row);
+    var quoteBlock = _waFindQuoteBlock(row);
+    var authorEl = container.querySelector('[testid="author"], [data-testid="author"]');
+
+    var quote = quoteBlock ? _waExtractQuote(quoteBlock) : null;
+    var sender = _waExtractSender(row, container, isOut, quoteBlock);
+    var text = _waExtractBody(container, quoteBlock, authorEl, SKIP);
+    var time = _waExtractTime(container);
+
+    if (!time) {
+        var pre = _waParsePrePlain(row);
+        if (pre && pre.time) time = pre.time;
+    }
+
+    return {
+        sender: sender,
+        text: text,
+        time: time,
+        isOutgoing: isOut,
+        quote: quote
+    };
+})(arguments[0]);
+"""
+)
 
 _JS_MSG_TEXT = (
     _JS_HELPERS
@@ -397,67 +597,10 @@ _JS_MSG_TEXT = (
     var SKIP = """
     + _JS_SKIP_ZONES
     + r""";
-    var root = row.querySelector('[data-testid="msg-container"]') || row;
+    var container = _waMsgRoot(row);
     var quoteBlock = _waFindQuoteBlock(row);
-
-    // Tier 1 — legacy selectable/copyable text containers.
-    var nodes = root.querySelectorAll(
-        '[data-testid="selectable-text"], span.selectable-text, span.copyable-text, [data-testid="conversation-text"]'
-    );
-    var parts = [];
-    outer:
-    for (var i = 0; i < nodes.length; i++) {
-        var node = nodes[i];
-        if (_waInside(node, SKIP)) continue outer;
-        if (quoteBlock && quoteBlock.contains(node)) continue outer;
-        var t = node.innerText;
-        if (t && t.trim()) parts.push(t.trim());
-    }
-    if (parts.length) return parts.join('\n');
-
-    // Tier 2 — dir spans / divs outside the quote block (join, don't pick longest).
-    var bodyParts = _waCollectBodyTexts(root, quoteBlock, SKIP);
-    if (bodyParts.length) return bodyParts.join('\n');
-
-    // Tier 2b — copyable-text wrapper (body as raw text nodes without dir hints).
-    var copyables = root.querySelectorAll('[data-pre-plain-text], .copyable-text');
-    for (var c = 0; c < copyables.length; c++) {
-        var copy = copyables[c];
-        if (_waInside(copy, SKIP)) continue;
-        var parts = _waCollectBodyTexts(copy, quoteBlock, SKIP);
-        if (parts.length) return parts.join('\n');
-        var raw = _waStripPrePrefix((copy.innerText || '').trim());
-        if (quoteBlock) {
-            var qtxt = (quoteBlock.innerText || '').trim();
-            if (qtxt && raw.indexOf(qtxt) >= 0) raw = raw.replace(qtxt, '').trim();
-        }
-        if (raw && !_waLooksLikeTimestamp(raw)) return raw;
-    }
-
-    // Tier 3 — walk descendant text nodes, filter chrome/icons/timestamps.
-    var chunks = [];
-    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-    var n;
-    while ((n = walker.nextNode())) {
-        var parent = n.parentElement;
-        if (!parent || _waInside(parent, SKIP)) continue;
-        if (quoteBlock && quoteBlock.contains(parent)) continue;
-        if (parent.closest('.wds-icon')) continue;
-        var raw = (n.textContent || '').trim();
-        if (!raw || _waLooksLikeTimestamp(raw) || _waLooksLikeStatusGlyph(raw) || _waLooksLikeIconLigature(raw)) continue;
-        chunks.push(raw);
-    }
-    if (chunks.length) return chunks.join(' ').trim();
-
-    // Tier 4 — full row text minus quote block, with data-pre-plain-text prefix stripped.
-    var full = (root.innerText || row.innerText || '').trim();
-    if (quoteBlock) {
-        var qtxt = (quoteBlock.innerText || '').trim();
-        if (qtxt && full.indexOf(qtxt) >= 0) {
-            full = full.replace(qtxt, '').trim();
-        }
-    }
-    return _waStripPrePrefix(full);
+    var authorEl = container.querySelector('[testid="author"], [data-testid="author"]');
+    return _waExtractBody(container, quoteBlock, authorEl, SKIP);
 })(arguments[0]);
 """
 )
@@ -468,62 +611,7 @@ _JS_QUOTE_PARSE = (
 (function(row) {
     var block = _waFindQuoteBlock(row);
     if (!block) return null;
-
-    var sender = '';
-    var text = '';
-
-    // Explicit author element (short name / phone above the preview).
-    var authorEl = block.querySelector('[data-testid="quoted-author"]');
-    if (authorEl) {
-        sender = (authorEl.innerText || '').trim();
-    }
-
-    // In current WhatsApp Web, quoted-mention holds the quoted MESSAGE TEXT,
-    // not the sender name.  Do NOT treat it as sender.
-    var mentionEl = block.querySelector('[data-testid="quoted-mention"]')
-        || block.querySelector('[class*="quoted-mention"]');
-    if (mentionEl) {
-        var mentionText = (mentionEl.innerText || '').trim();
-        if (mentionText) {
-            if (!text) text = mentionText;
-        }
-    }
-
-    // Fallback: ordered text lines inside the quote preview.
-    if (!text) {
-        var lines = [];
-        var spans = block.querySelectorAll('span[dir], div[dir]');
-        for (var i = 0; i < spans.length; i++) {
-            var sp = spans[i];
-            if (authorEl && (sp === authorEl || authorEl.contains(sp))) continue;
-            if (mentionEl && (sp === mentionEl || mentionEl.contains(sp))) continue;
-            var t = (sp.innerText || '').trim();
-            if (!t || _waLooksLikeTimestamp(t) || _waLooksLikeIconLigature(t)) continue;
-            lines.push(t);
-        }
-        if (lines.length >= 2 && _waLooksLikeSender(lines[0])) {
-            if (!sender) sender = lines[0];
-            text = lines.slice(1).join('\n');
-        } else if (lines.length) {
-            text = lines.join('\n');
-        }
-    }
-
-    if (!text) {
-        text = (block.innerText || '').trim();
-        if (sender && text.indexOf(sender) === 0) {
-            text = text.slice(sender.length).trim();
-        }
-    }
-
-    // Safety: long / URL / question content belongs in text, never sender.
-    if (sender && !_waLooksLikeSender(sender)) {
-        if (!text) text = sender;
-        sender = '';
-    }
-
-    if (!sender && !text) return null;
-    return { sender: sender, text: text };
+    return _waExtractQuote(block);
 })(arguments[0]);
 """
 )
@@ -532,66 +620,25 @@ _JS_SENDER = (
     _JS_HELPERS
     + r"""
 (function(row) {
-    var dataId = row.getAttribute('data-id') || '';
-    if (dataId.indexOf('true_') === 0 || row.querySelector('[data-testid="tail-out"]')) {
-        return 'You';
-    }
-
+    var container = _waMsgRoot(row);
+    var isOut = _waIsOutgoing(row);
     var quoteBlock = _waFindQuoteBlock(row);
-    var QUOTE_SKIP = [
-        '[data-testid="quoted-message"]',
-        '[data-testid="quoted-msg"]',
-        '[class*="quoted-message"]'
-    ];
-
-    var author = row.querySelector('[data-testid="author"]');
-    if (author && !_waInside(author, QUOTE_SKIP)) {
-        var at = (author.innerText || '').trim();
-        if (at) return at;
-    }
-
-    var pre = _waParsePrePlain(row);
-    if (pre && pre.sender) return pre.sender;
-
-    var labelled = row.querySelectorAll('[aria-label]');
-    for (var i = 0; i < labelled.length; i++) {
-        var el = labelled[i];
-        if (_waInside(el, QUOTE_SKIP)) continue;
-        var lbl = (el.getAttribute('aria-label') || '').trim();
-        if (lbl && lbl !== 'You:' && lbl.endsWith(':') && lbl.length > 1) {
-            var name = lbl.slice(0, -1).trim();
-            if (_waLooksLikeSender(name) || /^\+?[\d\s\-().@]+$/.test(name)) return name;
-        }
-    }
-
-    // Header spans: only accept phone numbers or short names, never quote text.
-    var container = row.querySelector('[data-testid="msg-container"]') || row;
-    var autoSpans = container.querySelectorAll('span[dir="auto"], span[dir="ltr"], span[dir="rtl"]');
-    for (var j = 0; j < autoSpans.length; j++) {
-        var sp = autoSpans[j];
-        if (_waInside(sp, QUOTE_SKIP)) continue;
-        if (_waInside(sp, ['[data-testid="msg-meta"]'])) continue;
-        if (quoteBlock && quoteBlock.contains(sp)) continue;
-        var txt = (sp.innerText || '').trim();
-        if (!txt || _waLooksLikeTimestamp(txt) || _waLooksLikeIconLigature(txt)) continue;
-        if (/^\+?[\d\s\-().@]+$/.test(txt)) return txt;
-        if (_waLooksLikeSender(txt)) return txt;
-    }
-
-    return '';
+    return _waExtractSender(row, container, isOut, quoteBlock);
 })(arguments[0]);
 """
 )
 
-_JS_REACTIONS = r"""
+_JS_REACTIONS = (
+    _JS_HELPERS
+    + r"""
 (function(row) {
     var results = [];
     var seen = {};
 
-    function add(emoji, count) {
+    function add(emoji, count, el) {
         if (!emoji || seen[emoji]) return;
         seen[emoji] = true;
-        results.push({ emoji: emoji, count: count || 1 });
+        results.push({ emoji: emoji, count: count || 1, el: el || null });
     }
 
     function firstEmoji(s) {
@@ -604,19 +651,35 @@ _JS_REACTIONS = r"""
         return m ? parseInt(m[0], 10) : 1;
     }
 
+    function scanReactionBubbles(root) {
+        if (!root) return;
+        var bubbles = root.querySelectorAll('[data-testid="reaction-bubble"]');
+        for (var b = 0; b < bubbles.length; b++) {
+            var btn = bubbles[b];
+            var emoji = '';
+            var lbl = btn.getAttribute('aria-label') || '';
+            var em = firstEmoji(lbl);
+            if (em) emoji = em;
+            if (!emoji) {
+                var img = btn.querySelector('[data-testid="reaction-bubble-item"] img[alt], img[alt]');
+                if (img) emoji = (img.getAttribute('alt') || '').trim();
+            }
+            if (emoji) add(emoji, 1, btn);
+        }
+    }
+
     function scanRoot(root) {
         if (!root) return;
-
+        scanReactionBubbles(root);
         var containers = root.querySelectorAll(
             '[data-testid="reactions-read-more-container"],' +
             '[data-testid="reactions-container"],' +
             '[data-testid="msg-reactions"],' +
-            '[data-testid="reactions-bubble"],' +
-            '[data-testid*="reaction"]'
+            '[data-testid="reactions-bubble"]'
         );
         for (var c = 0; c < containers.length; c++) {
             var container = containers[c];
-            var pills = container.querySelectorAll('[role="button"], button, span, div');
+            var pills = container.querySelectorAll('[role="button"], button');
             for (var p = 0; p < pills.length; p++) {
                 var pill = pills[p];
                 var txt = (pill.innerText || pill.textContent || '').trim();
@@ -625,42 +688,46 @@ _JS_REACTIONS = r"""
                 if (!emoji) continue;
                 var count = parseCount(txt.replace(emoji, ''));
                 if (count < 1) count = 1;
-                add(emoji, count);
+                add(emoji, count, pill);
             }
-        }
-
-        // Emoji-only spans (e.g. "👍" or "👍2") sitting on the message row.
-        var spans = root.querySelectorAll('span');
-        for (var s = 0; s < spans.length; s++) {
-            var sp = spans[s];
-            if (sp.closest('[data-testid="quoted-message"], [data-testid="msg-meta"], [data-testid="author"]')) continue;
-            var st = (sp.innerText || '').trim();
-            if (!st || st.length > 8) continue;
-            var em = firstEmoji(st);
-            if (!em) continue;
-            if (st.replace(em, '').trim().match(/^\d*$/)) {
-                add(em, parseCount(st.replace(em, '')));
-            }
-        }
-
-        var labelled = root.querySelectorAll('[aria-label]');
-        for (var i = 0; i < labelled.length; i++) {
-            var lbl = (labelled[i].getAttribute('aria-label') || '').trim();
-            if (!lbl) continue;
-            var low = lbl.toLowerCase();
-            if (low.indexOf('reaction') < 0 && lbl.indexOf('תגוב') < 0 && lbl.indexOf('הגיב') < 0) continue;
-            var emoji = firstEmoji(lbl);
-            if (emoji) add(emoji, parseCount(lbl));
         }
     }
 
-    // Reactions may live on the row, its parent wrapper, or a sibling of msg-container.
     scanRoot(row);
+    scanRoot(_waRowRoot(row));
     if (row.parentElement) scanRoot(row.parentElement);
     var container = row.querySelector('[data-testid="msg-container"]');
     if (container && container.parentElement) scanRoot(container.parentElement);
 
     return results;
+})(arguments[0]);
+"""
+)
+
+_JS_COLLECT_REACTORS = r"""
+(function(dialog) {
+    var names = [];
+    var seen = {};
+    function collect(root) {
+        var els = root.querySelectorAll('[data-testid="react-participant"]');
+        for (var i = 0; i < els.length; i++) {
+            var n = (els[i].innerText || els[i].textContent || '').trim();
+            if (n && !seen[n]) { seen[n] = true; names.push(n); }
+        }
+    }
+    var scrollEl = dialog.querySelector('[data-testid="scrollable-content"]')
+        || dialog.querySelector('[data-scrolltraceid]')
+        || dialog.querySelector('[role="list"]')
+        || dialog;
+    collect(scrollEl);
+    var lastTop = -1;
+    for (var attempt = 0; attempt < 40; attempt++) {
+        scrollEl.scrollTop += 180;
+        if (scrollEl.scrollTop === lastTop) break;
+        lastTop = scrollEl.scrollTop;
+        collect(scrollEl);
+    }
+    return names;
 })(arguments[0]);
 """
 
@@ -750,46 +817,101 @@ def find_all(el, css: str) -> list:
         return []
 
 
-def _extract_text(driver, row_el) -> str:
-    """
-    Return the message body text, correctly handling:
-      • Pure Hebrew (RTL)
-      • Pure English (LTR)
-      • Mixed Hebrew+English in the same message
-      • Messages that contain a quoted reply (quote text is excluded)
-      • Current WhatsApp Web DOM (span[dir] without selectable-text class)
+def _message_id(row_el) -> str:
+    """Return the WhatsApp message id from a row, its descendants, or ancestors."""
+    mid = row_el.get_attribute("data-id") or ""
+    if mid:
+        return mid
+    for sel in ("div[data-id]", '[data-id]'):
+        inner = find(row_el, sel)
+        if inner:
+            mid = inner.get_attribute("data-id") or ""
+            if mid:
+                return mid
+    try:
+        cur = row_el
+        for _ in range(10):
+            parent = cur.find_element(By.XPATH, "..")
+            mid = parent.get_attribute("data-id") or ""
+            if mid:
+                return mid
+            cur = parent
+    except (NoSuchElementException, StaleElementReferenceException):
+        pass
+    return ""
 
-    A single JS call is used so the browser's own bidirectional text engine
-    resolves the reading order — no guesswork in Python.
-    Falls back to a Python implementation if JS fails.
-    """
+
+def _reaction_scope(row_el):
+    """Return the row wrapper that also contains reaction bubbles."""
+    try:
+        return row_el.find_element(
+            By.XPATH,
+            "./ancestor::div[contains(@class,'focusable-list-item')][1]",
+        )
+    except (NoSuchElementException, StaleElementReferenceException):
+        return row_el
+
+
+def _is_outgoing(row_el) -> bool:
+    """Detect whether the message was sent by the logged-in user."""
+    mid = _message_id(row_el)
+    if mid.startswith("true_"):
+        return True
+    if find(row_el, S["tail_out"]):
+        return True
+    try:
+        cls = row_el.get_attribute("class") or ""
+        if "message-out" in cls.split():
+            return True
+    except StaleElementReferenceException:
+        pass
+    return bool(find(row_el, ".message-out"))
+
+
+def _parse_dom(driver, row_el) -> Optional[dict]:
+    """Extract sender, body, quote, time, direction from separate DOM zones."""
+    try:
+        return driver.execute_script(_JS_PARSE_MESSAGE, row_el)
+    except Exception:
+        return None
+
+
+def _extract_text(driver, row_el) -> str:
+    """Return message body text from the body zone only (never combined row text)."""
+    dom = _parse_dom(driver, row_el)
+    if dom and dom.get("text"):
+        return str(dom["text"]).strip()
     try:
         result = driver.execute_script(_JS_MSG_TEXT, row_el)
         return (result or "").strip()
     except Exception:
+        container = find(row_el, '[data-testid="msg-container"]') or row_el
         quote_block = _find_quote_block(row_el)
         parts = []
-        for sp in find_all(row_el, S["msg_text"]):
+        for sp in find_all(container, S["msg_text"]):
             try:
-                if quote_block and quote_block == sp:
-                    continue
-            except StaleElementReferenceException:
+                if quote_block:
+                    inside = driver.execute_script(
+                        "return arguments[0] && arguments[0].contains(arguments[1]);",
+                        quote_block, sp,
+                    )
+                    if inside:
+                        continue
+            except Exception:
                 pass
             t = sp.text.strip()
             if t:
                 parts.append(t)
-        if not parts:
-            for sp in find_all(row_el, 'span[dir="ltr"], span[dir="rtl"], span[dir="auto"]'):
-                t = sp.text.strip()
-                if t and not re.match(r"^\d{1,2}:\d{2}", t):
-                    parts.append(t)
         return "\n".join(parts).strip()
 
 
 def _extract_sender(driver, row_el, is_out: bool) -> str:
-    """Resolve sender name, including unsaved contacts shown as phone numbers."""
+    """Resolve sender from the author div only."""
     if is_out:
         return "You"
+    dom = _parse_dom(driver, row_el)
+    if dom and dom.get("sender"):
+        return str(dom["sender"]).strip()
     try:
         result = driver.execute_script(_JS_SENDER, row_el)
         if result and result != "You":
@@ -797,7 +919,8 @@ def _extract_sender(driver, row_el, is_out: bool) -> str:
     except Exception:
         pass
 
-    author_el = find(row_el, S["author"])
+    container = find(row_el, '[data-testid="msg-container"]') or row_el
+    author_el = find(container, S["author"])
     if author_el:
         a = author_el.text.strip()
         if a:
@@ -814,13 +937,10 @@ def _extract_sender(driver, row_el, is_out: bool) -> str:
 
 
 def _find_quote_block(row_el):
-    """Locate the quoted-message preview block using several fallback selectors."""
-    for sel in (
-        S["quote_block"],
-        '[data-testid="quoted-msg"]',
-        '[class*="quoted-message"]',
-    ):
-        block = find(row_el, sel)
+    """Locate the quoted-message preview block via data-testid only."""
+    container = find(row_el, '[data-testid="msg-container"]') or row_el
+    for sel in (S["quote_block"],):
+        block = find(container, sel)
         if block is not None:
             return block
     return None
@@ -1042,64 +1162,23 @@ def open_chat(driver: uc.Chrome, name: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def _looks_like_sender(name: str) -> bool:
-    """Heuristic: distinguish a contact name/phone from message body text."""
-    s = name.strip()
-    if not s or len(s) > 48:
-        return False
-    if re.match(r"^https?://", s, re.I):
-        return False
-    if re.match(r"^\+?[\d\s\-().@]+$", s):
-        return True
-    if s.startswith("@+"):
-        return True
-    if len(s) > 28 and ("?" in s or "!" in s):
-        return False
-    if len(re.findall(r"[.!?]", s)) > 1:
-        return False
-    return len(s) <= 32
-
-
-def _normalize_quote(quote: Optional[Quote]) -> Optional[Quote]:
-    """Move mis-assigned quote body text out of quote.sender."""
-    if quote is None:
-        return None
-    sender, text = quote.sender.strip(), quote.text.strip()
-    if sender and not text and not _looks_like_sender(sender):
-        return Quote(sender="", text=sender)
-    if sender and text and sender == text:
-        return Quote(sender="", text=text)
-    return Quote(sender=sender, text=text)
-
-
-def _strip_quote_from_text(text: str, quote: Optional[Quote]) -> str:
-    """Remove quoted preview text that leaked into the message body."""
-    if not quote or not text:
-        return text
-    for blob in (quote.text, quote.sender):
-        if not blob:
-            continue
-        if text == blob:
-            return ""
-        if text.startswith(blob):
-            text = text[len(blob):].strip()
-        if text.endswith(blob):
-            text = text[:-len(blob)].strip()
-    return text
-
-
 def _parse_quote(driver, row_el) -> Optional[Quote]:
-    """
-    Extract the quoted / replied-to message block.
-    In current WhatsApp Web, quoted-mention holds the preview TEXT, not the sender.
-    """
+    """Extract quote sender + text from the quoted-message div only."""
+    dom = _parse_dom(driver, row_el)
+    if dom and dom.get("quote"):
+        raw = dom["quote"]
+        return Quote(
+            sender=(raw.get("sender") or "").strip(),
+            text=(raw.get("text") or "").strip(),
+        )
+
     try:
         raw = driver.execute_script(_JS_QUOTE_PARSE, row_el)
         if raw:
-            return _normalize_quote(Quote(
+            return Quote(
                 sender=(raw.get("sender") or "").strip(),
                 text=(raw.get("text") or "").strip(),
-            ))
+            )
     except Exception:
         pass
 
@@ -1107,19 +1186,25 @@ def _parse_quote(driver, row_el) -> Optional[Quote]:
     if block is None:
         return None
 
-    mention_el = find(block, S["quote_author"]) or find(block, '[class*="quoted-mention"]')
-    author_el  = find(block, '[data-testid="quoted-author"]')
-    q_sender   = author_el.text.strip() if author_el else ""
-    q_text     = mention_el.text.strip() if mention_el else ""
+    author_el = find(block, '[data-testid="quoted-author"]')
+    if author_el is None:
+        for sp in find_all(block, '[testid="author"], [data-testid="author"]'):
+            author_el = sp
+            break
+    text_el = find(block, S["quote_text"])
+    q_sender  = author_el.text.strip() if author_el else ""
+    q_text    = text_el.text.strip() if text_el else ""
 
     if not q_text:
-        for sp in find_all(block, 'span[dir="ltr"], span[dir="rtl"], span[dir="auto"], div[dir]'):
+        for sp in find_all(block, 'span[dir], div[dir]'):
             t = sp.text.strip()
             if t and t != q_sender and not re.match(r"^\d{1,2}:\d{2}", t):
                 q_text = t
                 break
 
-    return _normalize_quote(Quote(sender=q_sender, text=q_text)) if (q_sender or q_text) else None
+    if not q_sender and not q_text:
+        return None
+    return Quote(sender=q_sender, text=q_text)
 
 
 def _parse_reactions_basic(driver, row_el) -> List[Reaction]:
@@ -1161,62 +1246,134 @@ def _parse_reactions_basic(driver, row_el) -> List[Reaction]:
     return results
 
 
+def _collect_reaction_senders(driver, dialog) -> List[str]:
+    """Scroll the reactions popup and collect every participant name."""
+    try:
+        names = driver.execute_script(_JS_COLLECT_REACTORS, dialog) or []
+        return [str(n).strip() for n in names if str(n).strip()]
+    except Exception:
+        pass
+
+    senders: List[str] = []
+    seen: set = set()
+    scroll_el = (
+        find(dialog, S["rxn_scroll"])
+        or find(dialog, '[role="list"]')
+        or dialog
+    )
+
+    for _ in range(40):
+        for name_el in find_all(dialog, S["rxn_name"]):
+            n = name_el.text.strip()
+            if n and n not in seen:
+                seen.add(n)
+                senders.append(n)
+
+        try:
+            prev = driver.execute_script("return arguments[0].scrollTop;", scroll_el)
+            driver.execute_script("arguments[0].scrollTop += 180;", scroll_el)
+            cur = driver.execute_script("return arguments[0].scrollTop;", scroll_el)
+            if cur == prev:
+                break
+        except Exception:
+            break
+        jitter(0.15, 0.35)
+
+    return senders
+
+
+def _find_reaction_pill(row_el, emoji: str):
+    """Locate the clickable reaction pill for a given emoji."""
+    scopes = [row_el]
+    try:
+        parent = row_el.find_element(By.XPATH, "..")
+        scopes.append(parent)
+    except (NoSuchElementException, StaleElementReferenceException):
+        pass
+
+    try:
+        root = row_el.find_element(By.XPATH, "./ancestor::div[contains(@class,'focusable-list-item')]")
+        scopes.append(root)
+    except (NoSuchElementException, StaleElementReferenceException):
+        pass
+
+    seen = set()
+    for scope in scopes:
+        if id(scope) in seen:
+            continue
+        seen.add(id(scope))
+        for pill in find_all(scope, S["rxn_pill"]):
+            try:
+                txt  = pill.text.strip()
+                aria = (pill.get_attribute("aria-label") or "").strip()
+                if emoji in txt or emoji in aria:
+                    return pill
+            except StaleElementReferenceException:
+                continue
+
+        for container in find_all(scope, '[data-testid="addon-bubble-container"]'):
+            for pill in find_all(container, '[data-testid="reaction-bubble"]'):
+                try:
+                    aria = (pill.get_attribute("aria-label") or "").strip()
+                    if emoji in pill.text.strip() or emoji in aria:
+                        return pill
+                except StaleElementReferenceException:
+                    continue
+
+        for container in find_all(scope, S["rxn_container"]):
+            for pill in find_all(container, '[role="button"], button'):
+                try:
+                    if emoji in pill.text.strip():
+                        return pill
+                except StaleElementReferenceException:
+                    continue
+    return None
+
+
 def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
     """
-    Click each reaction pill to open the 'who reacted' dialog, then harvest
-    names.  Much slower – use only with --reactions-detail.
+    Click each reaction pill to open the 'who reacted' dialog, scroll the
+    participant list, then harvest names.  Much slower – use only with
+    --reactions-detail.
     """
     basic    = _parse_reactions_basic(driver, row_el)
     detailed = []
 
     for rxn in basic:
-        # Locate the pill element for this emoji
-        pill_sel = (
-            f'[data-testid="reactions-read-more-container"] span,'
-            f'[data-testid="reactions-container"] span'
-        )
-        pills = find_all(row_el, pill_sel)
-        target_pill = None
-        for p in pills:
-            if p.text.strip() == rxn.emoji:
-                target_pill = p
-                break
-
         senders: List[str] = []
+        target_pill = _find_reaction_pill(row_el, rxn.emoji)
+
         if target_pill:
             try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", target_pill
+                )
+                jitter(0.2, 0.4)
                 ActionChains(driver).move_to_element(target_pill).perform()
-                jitter(0.3, 0.6)
+                jitter(0.2, 0.4)
                 target_pill.click()
                 jitter(0.5, 0.9)
 
-                # Wait for the reaction detail dialog
-                dialog = WebDriverWait(driver, 5).until(
+                dialog = WebDriverWait(driver, 6).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, S["rxn_dialog"]))
                 )
 
-                # If there are emoji tabs, click the right one
                 tabs = find_all(dialog, S["rxn_tab"])
                 for tab in tabs:
                     if rxn.emoji in tab.text:
                         tab.click()
-                        jitter(0.3, 0.6)
+                        jitter(0.25, 0.5)
                         break
 
-                # Collect names
-                for name_el in find_all(dialog, S["rxn_name"]):
-                    n = name_el.text.strip()
-                    if n:
-                        senders.append(n)
+                senders = _collect_reaction_senders(driver, dialog)
 
-                # Close dialog with Escape
                 ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-                jitter(0.4, 0.8)
+                jitter(0.3, 0.6)
 
             except (TimeoutException, StaleElementReferenceException,
                     ElementNotInteractableException):
                 ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-                jitter(0.3, 0.5)
+                jitter(0.2, 0.4)
 
         detailed.append(Reaction(emoji=rxn.emoji, count=rxn.count, senders=senders))
 
@@ -1227,37 +1384,45 @@ def _parse_message(driver, row_el, current_date: str,
                    reactions_detail: bool = False) -> Optional[Message]:
     """
     Parse a single message row into a Message dataclass.
+    Each field is read from its own DOM zone — never from combined row text.
     Returns None for system-event rows (e.g. "You were added to the group").
     """
     try:
-        mid = row_el.get_attribute("data-id")
+        mid = _message_id(row_el)
         if not mid:
             return None
 
-        # ── direction ─────────────────────────────────────────────────────────
-        # Legacy rows used data-id prefixes; current UI uses tail-out / tail-in.
-        is_out = mid.startswith("true_") or bool(find(row_el, S["tail_out"]))
+        dom = _parse_dom(driver, row_el)
 
-        # ── quote (parse before body so quote text is not mistaken for body) ──
+        is_out = (
+            dom.get("isOutgoing")
+            if dom and "isOutgoing" in dom
+            else _is_outgoing(row_el)
+        )
+
         quote = _parse_quote(driver, row_el)
+        sender = (
+            str(dom.get("sender") or "").strip()
+            if dom and dom.get("sender")
+            else _extract_sender(driver, row_el, is_out)
+        )
 
-        # ── sender ────────────────────────────────────────────────────────────
-        sender = _extract_sender(driver, row_el, is_out)
-
-        # ── timestamp ─────────────────────────────────────────────────────────
         msg_time = ""
-        meta_el  = find(row_el, S["msg_meta"])
-        if meta_el:
-            raw = meta_el.text.strip()
-            # The meta span contains "HH:MM" plus delivery tick icons
-            m   = re.search(r"\d{1,2}:\d{2}(?:\s?[AaPp][Mm])?", raw)
-            msg_time = m.group(0) if m else raw.split()[-1]
+        if dom and dom.get("time"):
+            msg_time = str(dom["time"]).strip()
+        if not msg_time:
+            meta_el = find(row_el, S["msg_meta"])
+            if meta_el:
+                raw = meta_el.text.strip()
+                m   = re.search(r"\d{1,2}:\d{2}(?:\s?[AaPp][Mm])?", raw)
+                msg_time = m.group(0) if m else raw.split()[-1]
 
-        # ── text ──────────────────────────────────────────────────────────────
-        text = _extract_text(driver, row_el)
-        text = _strip_quote_from_text(text, quote)
+        text = (
+            str(dom.get("text") or "").strip()
+            if dom and dom.get("text")
+            else _extract_text(driver, row_el)
+        )
 
-        # ── media type ────────────────────────────────────────────────────────
         media_type = None
         if not text:
             for mtype, sel in MEDIA_CHECKS:
@@ -1265,15 +1430,13 @@ def _parse_message(driver, row_el, current_date: str,
                     media_type = mtype
                     break
 
-        # Skip rows with no recognisable content (group-event cards, etc.)
         if not sender and not text and media_type is None:
             return None
 
-        # ── reactions ─────────────────────────────────────────────────────────
         reactions = (
-            _parse_reactions_detail(driver, row_el)
+            _parse_reactions_detail(driver, _reaction_scope(row_el))
             if reactions_detail
-            else _parse_reactions_basic(driver, row_el)
+            else _parse_reactions_basic(driver, _reaction_scope(row_el))
         )
 
         return Message(
@@ -1301,6 +1464,7 @@ def scrape_chat(
     driver:           uc.Chrome,
     scroll_pause:     float = 1.0,
     max_top_scrolls:  int   = 6000,
+    max_down_passes:  int   = 2500,
     reactions_detail: bool  = False,
 ) -> List[Message]:
     """
@@ -1319,24 +1483,28 @@ def scrape_chat(
     log("↑  Rewinding to the start of history …  (this may take a while)")
     prev_top  = -1
     stall_n   = 0
-    for _ in range(max_top_scrolls):
+    up_pass   = 0
+    for up_pass in range(1, max_top_scrolls + 1):
         wait_no_spinner(driver, panel)
         top = driver.execute_script("return arguments[0].scrollTop;", panel)
 
+        if up_pass == 1 or up_pass % 25 == 0:
+            log(f"  ↑ pass {up_pass}, scrollTop={top}")
+
         if top == 0:
-            # Confirm we are truly at the top (wait for any background load)
             jitter(1.0, 1.8)
             wait_no_spinner(driver, panel)
             if driver.execute_script("return arguments[0].scrollTop;", panel) == 0:
+                log(f"  ↑ reached top after {up_pass} passes")
                 break
 
         if top == prev_top:
-            # Scrolling is not moving – wait for older batch to load
             stall_n += 1
             jitter(2.0, 3.5)
             wait_no_spinner(driver, panel)
             if stall_n >= 4:
-                break          # Genuinely stuck at top
+                log(f"  ↑ stop rewind (stall at scrollTop={top})")
+                break
         else:
             stall_n = 0
 
@@ -1348,12 +1516,15 @@ def scrape_chat(
     jitter(1.2, 2.2)
 
     # ── scroll down + collect ─────────────────────────────────────────────────
-    messages:     Dict[str, Message] = {}
-    current_date: str = datetime.today().strftime("%d/%m/%Y")  # fallback
-    no_new_streak = 0
+    messages:      Dict[str, Message] = {}
+    current_date:  str = datetime.today().strftime("%d/%m/%Y")
+    no_new_streak  = 0
+    pass_n         = 0
+    last_scroll_top = -1
+    same_scroll_streak = 0
 
-    while True:
-        # Re-acquire panel in case of stale reference after a long pause
+    while pass_n < max_down_passes:
+        pass_n += 1
         try:
             items = panel.find_elements(
                 By.CSS_SELECTOR,
@@ -1370,7 +1541,6 @@ def scrape_chat(
 
         for item in items:
             try:
-                # ── date-separator card ───────────────────────────────────────
                 testid = item.get_attribute("data-testid") or ""
                 if testid == "msg-dateseparator":
                     raw = item.text.strip()
@@ -1378,15 +1548,9 @@ def scrape_chat(
                         current_date = normalize_date(raw)
                     continue
 
-                # ── date separator nested inside a data-id row ────────────────
-                nested = find(item, S["date_card"])
-                if nested:
-                    raw = nested.text.strip()
-                    if raw:
-                        current_date = normalize_date(raw)
-                    continue   # row only contains the date card, no message
+                if testid != "msg-container":
+                    continue
 
-                # ── message row ───────────────────────────────────────────────
                 msg = _parse_message(driver, item, current_date, reactions_detail)
                 if msg and msg.id not in messages:
                     messages[msg.id] = msg
@@ -1394,24 +1558,44 @@ def scrape_chat(
             except StaleElementReferenceException:
                 continue
 
-        added        = len(messages) - before
+        added = len(messages) - before
         no_new_streak = 0 if added else no_new_streak + 1
 
-        # ── check if we're at the bottom ──────────────────────────────────────
-        scroll_top    = driver.execute_script("return arguments[0].scrollTop;",    panel)
+        scroll_top    = driver.execute_script("return arguments[0].scrollTop;", panel)
         scroll_height = driver.execute_script("return arguments[0].scrollHeight;", panel)
         client_height = driver.execute_script("return arguments[0].clientHeight;", panel)
         at_bottom     = (scroll_top + client_height) >= (scroll_height - 20)
 
-        if at_bottom and no_new_streak >= 4:
+        if scroll_top == last_scroll_top:
+            same_scroll_streak += 1
+        else:
+            same_scroll_streak = 0
+        last_scroll_top = scroll_top
+
+        if pass_n == 1 or pass_n % 10 == 0 or added:
+            log(
+                f"  ↓ pass {pass_n}: {len(messages)} total"
+                f" (+{added} new), scrollTop={scroll_top}"
+            )
+
+        if at_bottom and no_new_streak >= 3:
             log(f"\n✓  End of chat reached.  {len(messages)} messages captured.")
+            break
+
+        if same_scroll_streak >= 6 and no_new_streak >= 3:
+            log(
+                f"\n✓  Scroll stalled near end.  {len(messages)} messages captured."
+            )
             break
 
         scroll_by(driver, panel, random.randint(380, 720))
         jitter(scroll_pause * 0.6, scroll_pause * 1.4)
 
-        if added and len(messages) % 50 == 0:
-            print(f"  {len(messages)} messages collected …", end="\r", flush=True)
+    else:
+        log(
+            f"\n⚠  Stopped after {max_down_passes} down-scroll passes.  "
+            f"{len(messages)} messages captured."
+        )
 
     return list(messages.values())
 
@@ -1445,7 +1629,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--max-top-scrolls", type=int, default=6000,
-        help="Max upward scroll attempts when rewinding to top (default: 600).",
+        help="Max upward scroll attempts when rewinding to top (default: 6000).",
+    )
+    ap.add_argument(
+        "--max-down-passes", type=int, default=2500,
+        help="Max downward scroll passes when reading messages (default: 2500).",
     )
     ap.add_argument(
         "--reactions-detail", action="store_true",
@@ -1471,6 +1659,7 @@ def main() -> None:
             driver,
             scroll_pause     = args.scroll_pause,
             max_top_scrolls  = args.max_top_scrolls,
+            max_down_passes  = args.max_down_passes,
             reactions_detail = args.reactions_detail,
         )
 
