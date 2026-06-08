@@ -195,7 +195,9 @@ S: Dict[str, str] = {
     # ── emoji reactions ────────────────────────────────────────────────────────
     "rxn_container": (
         '[data-testid="reactions-read-more-container"],'
-        '[data-testid="reactions-container"]'
+        '[data-testid="reactions-container"],'
+        '[data-testid="msg-reactions"],'
+        '[data-testid*="reactions"]'
     ),
     # Dialog that opens when you click a reaction pill
     "rxn_dialog":    '[data-testid="reactions-list"]',
@@ -281,50 +283,269 @@ _HE_MONTHS: Dict[str, int] = {
 #  and the timestamp meta-span, which all contain their own span[dir] nodes.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_JS_MSG_TEXT = r"""
+# Shared skip-list for zones that must never contribute to message body text.
+_JS_SKIP_ZONES = r"""[
+    '[data-testid="quoted-message"]',
+    '[data-testid="quoted-msg"]',
+    '[class*="quoted-message"]',
+    '[class*="quoted-mention"]',
+    '[data-testid="reactions-read-more-container"]',
+    '[data-testid="reactions-container"]',
+    '[data-testid="msg-reactions"]',
+    '[data-testid*="reactions"]',
+    '[data-testid="msg-meta"]',
+    '[data-testid="author"]',
+    '[data-testid="image-thumb"]',
+    '[data-testid="video-thumb"]',
+    '[data-testid="audio-player"]',
+    '[data-testid="sticker-media"]',
+    '[data-testid="document-thumb"]',
+    '[data-testid="location-map"]',
+    '.wds-icon'
+]"""
+
+_JS_HELPERS = r"""
+function _waInside(el, selectors) {
+    for (var i = 0; i < selectors.length; i++) {
+        if (el.closest(selectors[i])) return true;
+    }
+    return false;
+}
+function _waLooksLikeTimestamp(s) {
+    s = (s || '').trim();
+    return /^\d{1,2}:\d{2}(\s?[AaPp][Mm])?$/.test(s);
+}
+function _waLooksLikeStatusGlyph(s) {
+    s = (s || '').trim();
+    return s.length > 0 && s.length <= 2 && /^[\u2713\u2714\u{1F507}\u{1F508}\u{1F509}]+$/u.test(s);
+}
+function _waLooksLikeIconLigature(s) {
+    s = (s || '').trim();
+    if (!s) return true;
+    if (s.indexOf('wds-ic-') === 0 || s.indexOf('wds-icon') === 0) return true;
+    return !/\s/.test(s) && /^[a-z0-9_-]+$/.test(s) && s.length > 3;
+}
+function _waStripPrePrefix(text) {
+    var t = (text || '').trim();
+    var open = t.indexOf('[');
+    if (open !== 0) return t;
+    var close = t.indexOf(']');
+    if (close < 0) return t;
+    var rest = t.slice(close + 1).trim();
+    var colon = rest.indexOf(':');
+    if (colon < 0) return t;
+    return rest.slice(colon + 1).trim();
+}
+function _waParsePrePlain(row) {
+    var el = row.querySelector('[data-pre-plain-text]');
+    if (!el) return null;
+    var pre = el.getAttribute('data-pre-plain-text') || '';
+    var m = pre.match(/^\[([^\]]+)\]\s*(.+?):\s*$/);
+    if (!m) return null;
+    return { time: m[1].trim(), sender: m[2].trim() };
+}
+function _waFindQuoteBlock(row) {
+    return row.querySelector('[data-testid="quoted-message"]')
+        || row.querySelector('[data-testid="quoted-msg"]')
+        || row.querySelector('[class*="quoted-message"]');
+}
+"""
+
+_JS_MSG_TEXT = (
+    _JS_HELPERS
+    + r"""
 (function(row) {
-    var skip = [
-        '[data-testid="quoted-message"]',
-        '[data-testid="reactions-read-more-container"]',
-        '[data-testid="reactions-container"]',
-        '[data-testid="msg-meta"]',
-        '[data-testid="author"]'
-    ];
-    var nodes = row.querySelectorAll(
-        '[data-testid="selectable-text"], span.selectable-text, span.copyable-text'
+    var SKIP = """
+    + _JS_SKIP_ZONES
+    + r""";
+    var root = row.querySelector('[data-testid="msg-container"]') || row;
+    var quoteBlock = _waFindQuoteBlock(row);
+
+    // Tier 1 — legacy selectable/copyable text containers.
+    var nodes = root.querySelectorAll(
+        '[data-testid="selectable-text"], span.selectable-text, span.copyable-text, [data-testid="conversation-text"]'
     );
     var parts = [];
     outer:
     for (var i = 0; i < nodes.length; i++) {
         var node = nodes[i];
-        for (var j = 0; j < skip.length; j++) {
-            if (node.closest(skip[j])) continue outer;
-        }
+        if (_waInside(node, SKIP)) continue outer;
+        if (quoteBlock && quoteBlock.contains(node)) continue outer;
         var t = node.innerText;
         if (t && t.trim()) parts.push(t.trim());
     }
-    return parts.join('\n');
+    if (parts.length) return parts.join('\n');
+
+    // Tier 2 — span[dir] (current WhatsApp Web); longest non-chrome span wins.
+    var best = '';
+    var dirSpans = root.querySelectorAll('span[dir="ltr"], span[dir="rtl"], span[dir="auto"]');
+    for (var j = 0; j < dirSpans.length; j++) {
+        var sp = dirSpans[j];
+        if (_waInside(sp, SKIP)) continue;
+        if (quoteBlock && quoteBlock.contains(sp)) continue;
+        var txt = (sp.innerText || '').trim();
+        if (!txt || _waLooksLikeTimestamp(txt) || _waLooksLikeStatusGlyph(txt) || _waLooksLikeIconLigature(txt)) continue;
+        if (txt.length > best.length) best = txt;
+    }
+    if (best) return best;
+
+    // Tier 3 — walk descendant text nodes, filter chrome/icons/timestamps.
+    var chunks = [];
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    var n;
+    while ((n = walker.nextNode())) {
+        var parent = n.parentElement;
+        if (!parent || _waInside(parent, SKIP)) continue;
+        if (quoteBlock && quoteBlock.contains(parent)) continue;
+        if (parent.closest('.wds-icon')) continue;
+        var raw = (n.textContent || '').trim();
+        if (!raw || _waLooksLikeTimestamp(raw) || _waLooksLikeStatusGlyph(raw) || _waLooksLikeIconLigature(raw)) continue;
+        chunks.push(raw);
+    }
+    if (chunks.length) return chunks.join(' ').trim();
+
+    // Tier 4 — full row text with data-pre-plain-text prefix stripped.
+    var full = (root.innerText || row.innerText || '').trim();
+    return _waStripPrePrefix(full);
 })(arguments[0]);
 """
+)
 
-_JS_QUOTE_TEXT = r"""
+_JS_QUOTE_TEXT = (
+    _JS_HELPERS
+    + r"""
 (function(block) {
-    // Prefer direct-child spans (avoids double-counting nested RTL/LTR)
-    var spans = block.querySelectorAll('span.selectable-text > span[dir]');
+    var authorEl = block.querySelector('[data-testid="quoted-mention"]')
+        || block.querySelector('[class*="quoted-mention"]');
+    var authorText = authorEl ? authorEl.innerText.trim() : '';
+
+    var nodes = block.querySelectorAll(
+        '[data-testid="selectable-text"], span.selectable-text, span.copyable-text, [data-testid="conversation-text"]'
+    );
     var parts = [];
-    for (var i = 0; i < spans.length; i++) {
-        var t = spans[i].innerText;
-        if (t && t.trim()) parts.push(t.trim());
+    for (var i = 0; i < nodes.length; i++) {
+        var t = (nodes[i].innerText || '').trim();
+        if (t && t !== authorText) parts.push(t);
     }
-    // Fallback: any span[dir] if the preferred selector found nothing
-    if (!parts.length) {
-        spans = block.querySelectorAll('span[dir]');
-        for (var i = 0; i < spans.length; i++) {
-            var t = spans[i].innerText;
-            if (t && t.trim()) parts.push(t.trim());
+    if (parts.length) return parts.join(' ');
+
+    var best = '';
+    var spans = block.querySelectorAll('span[dir="ltr"], span[dir="rtl"], span[dir="auto"]');
+    for (var j = 0; j < spans.length; j++) {
+        var sp = spans[j];
+        if (authorEl && (sp === authorEl || authorEl.contains(sp))) continue;
+        var txt = (sp.innerText || '').trim();
+        if (!txt || txt === authorText) continue;
+        if (_waLooksLikeTimestamp(txt) || _waLooksLikeIconLigature(txt)) continue;
+        if (txt.length > best.length) best = txt;
+    }
+    if (best) return best;
+
+    var full = (block.innerText || '').trim();
+    if (authorText && full.indexOf(authorText) === 0) {
+        full = full.slice(authorText.length).trim();
+    }
+    return full;
+})(arguments[0]);
+"""
+)
+
+_JS_SENDER = (
+    _JS_HELPERS
+    + r"""
+(function(row) {
+    var dataId = row.getAttribute('data-id') || '';
+    if (dataId.indexOf('true_') === 0 || row.querySelector('[data-testid="tail-out"]')) {
+        return 'You';
+    }
+
+    var author = row.querySelector('[data-testid="author"]');
+    if (author) {
+        var at = (author.innerText || '').trim();
+        if (at) return at;
+    }
+
+    var pre = _waParsePrePlain(row);
+    if (pre && pre.sender) return pre.sender;
+
+    var labelled = row.querySelectorAll('[aria-label]');
+    for (var i = 0; i < labelled.length; i++) {
+        var lbl = (labelled[i].getAttribute('aria-label') || '').trim();
+        if (lbl && lbl !== 'You:' && lbl.endsWith(':') && lbl.length > 1) {
+            return lbl.slice(0, -1).trim();
         }
     }
-    return parts.join(' ');
+
+    // Phone-number / unsaved-contact fallback: first dir=auto span in bubble header.
+    var container = row.querySelector('[data-testid="msg-container"]') || row;
+    var autoSpans = container.querySelectorAll('span[dir="auto"]');
+    for (var j = 0; j < autoSpans.length; j++) {
+        var sp = autoSpans[j];
+        if (_waInside(sp, ['[data-testid="quoted-message"]', '[data-testid="quoted-msg"]', '[class*="quoted-message"]'])) continue;
+        if (_waInside(sp, ['[data-testid="msg-meta"]'])) continue;
+        var txt = (sp.innerText || '').trim();
+        if (!txt || _waLooksLikeTimestamp(txt) || _waLooksLikeIconLigature(txt)) continue;
+        // Accept phone numbers (+972…), digits-with-dashes, or any short header name.
+        if (/^\+?[\d\s\-().]+$/.test(txt) || txt.length <= 64) return txt;
+    }
+
+    return '';
+})(arguments[0]);
+"""
+)
+
+_JS_REACTIONS = r"""
+(function(row) {
+    var results = [];
+    var seen = {};
+
+    function add(emoji, count) {
+        if (!emoji || seen[emoji]) return;
+        seen[emoji] = true;
+        results.push({ emoji: emoji, count: count || 1 });
+    }
+
+    function firstEmoji(s) {
+        var m = (s || '').match(/\p{Extended_Pictographic}/u);
+        return m ? m[0] : '';
+    }
+
+    function parseCount(s) {
+        var m = (s || '').match(/\d+/);
+        return m ? parseInt(m[0], 10) : 1;
+    }
+
+    var containers = row.querySelectorAll(
+        '[data-testid="reactions-read-more-container"],' +
+        '[data-testid="reactions-container"],' +
+        '[data-testid="msg-reactions"],' +
+        '[data-testid*="reactions"]'
+    );
+
+    for (var c = 0; c < containers.length; c++) {
+        var container = containers[c];
+        var pills = container.querySelectorAll('[role="button"], button, span');
+        for (var p = 0; p < pills.length; p++) {
+            var pill = pills[p];
+            var txt = (pill.innerText || pill.textContent || '').trim();
+            if (!txt) continue;
+            var emoji = firstEmoji(txt);
+            if (!emoji) continue;
+            var count = parseCount(txt.replace(emoji, ''));
+            if (count < 1) count = 1;
+            add(emoji, count);
+        }
+    }
+
+    var labelled = row.querySelectorAll('[aria-label]');
+    for (var i = 0; i < labelled.length; i++) {
+        var lbl = (labelled[i].getAttribute('aria-label') || '').trim();
+        if (!lbl || (lbl.toLowerCase().indexOf('reaction') < 0 && lbl.indexOf('תגוב') < 0)) continue;
+        var emoji = firstEmoji(lbl);
+        if (emoji) add(emoji, parseCount(lbl));
+    }
+
+    return results;
 })(arguments[0]);
 """
 
@@ -421,6 +642,7 @@ def _extract_text(driver, row_el) -> str:
       • Pure English (LTR)
       • Mixed Hebrew+English in the same message
       • Messages that contain a quoted reply (quote text is excluded)
+      • Current WhatsApp Web DOM (span[dir] without selectable-text class)
 
     A single JS call is used so the browser's own bidirectional text engine
     resolves the reading order — no guesswork in Python.
@@ -430,12 +652,63 @@ def _extract_text(driver, row_el) -> str:
         result = driver.execute_script(_JS_MSG_TEXT, row_el)
         return (result or "").strip()
     except Exception:
-        parts = [
-            sp.text.strip()
-            for sp in find_all(row_el, S["msg_text"])
-            if sp.text and sp.text.strip()
-        ]
+        quote_block = _find_quote_block(row_el)
+        parts = []
+        for sp in find_all(row_el, S["msg_text"]):
+            try:
+                if quote_block and quote_block == sp:
+                    continue
+            except StaleElementReferenceException:
+                pass
+            t = sp.text.strip()
+            if t:
+                parts.append(t)
+        if not parts:
+            for sp in find_all(row_el, 'span[dir="ltr"], span[dir="rtl"], span[dir="auto"]'):
+                t = sp.text.strip()
+                if t and not re.match(r"^\d{1,2}:\d{2}", t):
+                    parts.append(t)
         return "\n".join(parts).strip()
+
+
+def _extract_sender(driver, row_el, is_out: bool) -> str:
+    """Resolve sender name, including unsaved contacts shown as phone numbers."""
+    if is_out:
+        return "You"
+    try:
+        result = driver.execute_script(_JS_SENDER, row_el)
+        if result and result != "You":
+            return str(result).strip()
+    except Exception:
+        pass
+
+    author_el = find(row_el, S["author"])
+    if author_el:
+        a = author_el.text.strip()
+        if a:
+            return a
+
+    copyable = find(row_el, "[data-pre-plain-text]")
+    if copyable:
+        pre = copyable.get_attribute("data-pre-plain-text") or ""
+        m = re.match(r"^\[[^\]]+\]\s*(.+?):\s*$", pre.strip())
+        if m:
+            return m.group(1).strip()
+
+    return ""
+
+
+def _find_quote_block(row_el):
+    """Locate the quoted-message preview block using several fallback selectors."""
+    for sel in (
+        S["quote_block"],
+        '[data-testid="quoted-msg"]',
+        '[class*="quoted-message"]',
+    ):
+        block = find(row_el, sel)
+        if block is not None:
+            return block
+    return None
 
 
 def normalize_date(raw: str) -> str:
@@ -660,12 +933,12 @@ def _parse_quote(driver, row_el) -> Optional[Quote]:
     Uses JS (_JS_QUOTE_TEXT) so Hebrew, English, and mixed quote text
     are all read correctly without span double-counting.
     """
-    block = find(row_el, S["quote_block"])
+    block = _find_quote_block(row_el)
     if block is None:
         return None
 
     # Sender of the quoted message (the coloured mention span)
-    author_el = find(block, S["quote_author"])
+    author_el = find(block, S["quote_author"]) or find(block, '[class*="quoted-mention"]')
     q_sender  = author_el.text.strip() if author_el else ""
 
     # Text of the quoted message
@@ -674,9 +947,9 @@ def _parse_quote(driver, row_el) -> Optional[Quote]:
         q_text = (q_text or "").strip()
     except Exception:
         q_text = ""
-        for sp in find_all(block, "span[dir]"):
+        for sp in find_all(block, 'span[dir="ltr"], span[dir="rtl"], span[dir="auto"]'):
             t = sp.text.strip()
-            if t and t != q_sender:
+            if t and t != q_sender and not re.match(r"^\d{1,2}:\d{2}", t):
                 q_text = t
                 break
 
@@ -687,11 +960,21 @@ def _parse_quote(driver, row_el) -> Optional[Quote]:
     return Quote(sender=q_sender, text=q_text) if (q_sender or q_text) else None
 
 
-def _parse_reactions_basic(row_el) -> List[Reaction]:
+def _parse_reactions_basic(driver, row_el) -> List[Reaction]:
     """
     Collect emoji reactions from the inline pills without any clicks.
     Returns a list of Reaction(emoji, count, senders=[]).
     """
+    try:
+        raw = driver.execute_script(_JS_REACTIONS, row_el) or []
+        return [
+            Reaction(emoji=item["emoji"], count=int(item.get("count", 1)), senders=[])
+            for item in raw
+            if item.get("emoji")
+        ]
+    except Exception:
+        pass
+
     results: List[Reaction] = []
     for container in find_all(row_el, S["rxn_container"]):
         try:
@@ -721,7 +1004,7 @@ def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
     Click each reaction pill to open the 'who reacted' dialog, then harvest
     names.  Much slower – use only with --reactions-detail.
     """
-    basic    = _parse_reactions_basic(row_el)
+    basic    = _parse_reactions_basic(driver, row_el)
     detailed = []
 
     for rxn in basic:
@@ -793,13 +1076,11 @@ def _parse_message(driver, row_el, current_date: str,
         # Legacy rows used data-id prefixes; current UI uses tail-out / tail-in.
         is_out = mid.startswith("true_") or bool(find(row_el, S["tail_out"]))
 
+        # ── quote (parse before body so quote text is not mistaken for body) ──
+        quote = _parse_quote(driver, row_el)
+
         # ── sender ────────────────────────────────────────────────────────────
-        sender    = "You" if is_out else ""
-        author_el = find(row_el, S["author"])
-        if author_el:
-            a = author_el.text.strip()
-            if a:
-                sender = a
+        sender = _extract_sender(driver, row_el, is_out)
 
         # ── timestamp ─────────────────────────────────────────────────────────
         msg_time = ""
@@ -811,9 +1092,15 @@ def _parse_message(driver, row_el, current_date: str,
             msg_time = m.group(0) if m else raw.split()[-1]
 
         # ── text ──────────────────────────────────────────────────────────────
-        # _extract_text uses JS so Hebrew (RTL), English (LTR), and mixed
-        # messages are all captured correctly without double-counting.
         text = _extract_text(driver, row_el)
+
+        # If quote text leaked into body (DOM drift), recover the reply body.
+        if quote and quote.text and text == quote.text:
+            text = ""
+        elif quote and quote.text and text.startswith(quote.text):
+            text = text[len(quote.text):].strip()
+        if quote and quote.sender and text == quote.sender:
+            text = ""
 
         # ── media type ────────────────────────────────────────────────────────
         media_type = None
@@ -831,7 +1118,7 @@ def _parse_message(driver, row_el, current_date: str,
         reactions = (
             _parse_reactions_detail(driver, row_el)
             if reactions_detail
-            else _parse_reactions_basic(row_el)
+            else _parse_reactions_basic(driver, row_el)
         )
 
         return Message(
@@ -841,7 +1128,7 @@ def _parse_message(driver, row_el, current_date: str,
             sender      = sender,
             text        = text,
             is_outgoing = is_out,
-            quote       = _parse_quote(driver, row_el),
+            quote       = quote,
             reactions   = reactions,
             media_type  = media_type,
         )
