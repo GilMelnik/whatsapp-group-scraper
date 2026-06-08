@@ -138,13 +138,39 @@ class Message:
 #  update only this dictionary.
 # ══════════════════════════════════════════════════════════════════════════════
 
+# WhatsApp updates its DOM often; try selectors in order until one matches.
+APP_READY_SELECTORS: List[str] = [
+    '[data-testid="chat-list-search-container"]',
+    '[data-testid="chat-list"]',
+    '[data-testid="chat-list-search"]',          # legacy
+    '#side input[data-tab="3"]',
+    'div[contenteditable="true"][data-tab="3"]', # legacy
+]
+
+QR_CODE_SELECTORS: List[str] = [
+    '[data-testid="qrcode"]',
+    'canvas[aria-label*="QR"]',
+    '[data-testid="intro-md-beta-logo-dark"]',
+]
+
+SEARCH_INPUT_SELECTORS: List[str] = [
+    '[data-testid="chat-list-search-container"] input[type="text"]',
+    'input[data-testid="search-input"]',
+    '[data-testid="chat-list-search"] input[type="text"]',
+    '#side input[data-tab="3"]',
+    'input[aria-label="Search or start a new chat"]',
+    'input[aria-label="Search or start new chat"]',
+    'div[contenteditable="true"][data-tab="3"]',  # legacy
+    '[data-testid="chat-list-search"]',         # legacy container
+]
+
 S: Dict[str, str] = {
     # ── login ──────────────────────────────────────────────────────────────────
     "qr_code":       '[data-testid="qrcode"]',
-    "app_ready":     '[data-testid="chat-list-search"]',
+    "app_ready":     '[data-testid="chat-list-search-container"]',
 
     # ── search / chat list ─────────────────────────────────────────────────────
-    "search_box":    '[data-testid="chat-list-search"]',
+    "search_box":    '[data-testid="chat-list-search-container"] input[type="text"]',
     "chat_cell":     '[data-testid="cell-frame-container"]',
     "cell_title":    '[data-testid="cell-frame-title"] span',
 
@@ -158,8 +184,9 @@ S: Dict[str, str] = {
     "author":        '[data-testid="author"]',
     # Direct-child (>) is essential: descendant ( ) would double-count nested
     # span[dir] elements that WhatsApp inserts for mixed Hebrew/English text.
-    "msg_text":      'span.selectable-text > span[dir]',
+    "msg_text":      '[data-testid="selectable-text"], span.copyable-text',
     "msg_meta":      '[data-testid="msg-meta"]',           # time + tick icons
+    "tail_out":      '[data-testid="tail-out"]',
 
     # ── quoted / replied-to preview ────────────────────────────────────────────
     "quote_block":   '[data-testid="quoted-message"]',
@@ -181,7 +208,7 @@ S: Dict[str, str] = {
     "m_audio":    '[data-testid="audio-player"]',
     "m_sticker":  '[data-testid="sticker-media"]',
     "m_doc":      '[data-testid="document-thumb"]',
-    "m_gif":      '[data-testid="gif-thumb"]',
+    "m_gif":      '[data-testid="gif-thumb"],[data-testid="image-thumb-gif"]',
     "m_location": '[data-testid="location-map"]',
 }
 
@@ -260,18 +287,21 @@ _JS_MSG_TEXT = r"""
         '[data-testid="quoted-message"]',
         '[data-testid="reactions-read-more-container"]',
         '[data-testid="reactions-container"]',
-        '[data-testid="msg-meta"]'
+        '[data-testid="msg-meta"]',
+        '[data-testid="author"]'
     ];
-    var spans = row.querySelectorAll('span.selectable-text > span[dir]');
+    var nodes = row.querySelectorAll(
+        '[data-testid="selectable-text"], span.selectable-text, span.copyable-text'
+    );
     var parts = [];
     outer:
-    for (var i = 0; i < spans.length; i++) {
-        var sp = spans[i];
+    for (var i = 0; i < nodes.length; i++) {
+        var node = nodes[i];
         for (var j = 0; j < skip.length; j++) {
-            if (sp.closest(skip[j])) continue outer;
+            if (node.closest(skip[j])) continue outer;
         }
-        var t = sp.innerText;
-        if (t && t.trim()) parts.push(t);
+        var t = node.innerText;
+        if (t && t.trim()) parts.push(t.trim());
     }
     return parts.join('\n');
 })(arguments[0]);
@@ -303,9 +333,54 @@ _JS_QUOTE_TEXT = r"""
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def log(msg: str) -> None:
+    """Print immediately so progress is visible when stdout is piped/buffered."""
+    print(msg, flush=True)
+
+
 def jitter(lo: float = 0.3, hi: float = 1.0) -> None:
     """Random sleep to break up robotic timing patterns."""
     time.sleep(random.uniform(lo, hi))
+
+
+def wait_for_any_selector(
+    driver,
+    selectors: List[str],
+    timeout: float,
+    condition=EC.presence_of_element_located,
+):
+    """Return the first element matched by any selector within timeout."""
+    deadline = time.time() + timeout
+    last_err: Optional[Exception] = None
+    while time.time() < deadline:
+        for sel in selectors:
+            try:
+                return WebDriverWait(driver, 0.5).until(
+                    condition((By.CSS_SELECTOR, sel))
+                )
+            except TimeoutException as exc:
+                last_err = exc
+        time.sleep(0.25)
+    raise TimeoutException(
+        f"Timed out waiting for any of: {', '.join(selectors)}"
+    ) from last_err
+
+
+def find_search_input(driver) -> Optional[object]:
+    """Locate the real search input (WhatsApp moved it inside a container div)."""
+    for sel in SEARCH_INPUT_SELECTORS:
+        els = driver.find_elements(By.CSS_SELECTOR, sel)
+        if not els:
+            continue
+        el = els[0]
+        if el.tag_name.lower() == "input":
+            return el
+        inner = find(el, 'input[type="text"]') or find(el, "input")
+        if inner:
+            return inner
+        if el.get_attribute("contenteditable") == "true":
+            return el
+    return None
 
 
 def scroll_by(driver, el, px: int, step: int = 120) -> None:
@@ -355,10 +430,10 @@ def _extract_text(driver, row_el) -> str:
         result = driver.execute_script(_JS_MSG_TEXT, row_el)
         return (result or "").strip()
     except Exception:
-        # Python fallback: direct-child selector avoids double-counting
         parts = [
-            sp.text for sp in find_all(row_el, "span.selectable-text > span[dir]")
-            if sp.text
+            sp.text.strip()
+            for sp in find_all(row_el, S["msg_text"])
+            if sp.text and sp.text.strip()
         ]
         return "\n".join(parts).strip()
 
@@ -461,6 +536,8 @@ def build_driver(profile_dir: Optional[str] = None) -> uc.Chrome:
     opts.add_argument("--lang=he,en-US,en")   # Hebrew first so WA date cards come in Hebrew
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
 
     pdir = (
         Path(profile_dir)
@@ -486,22 +563,20 @@ def build_driver(profile_dir: Optional[str] = None) -> uc.Chrome:
 
 def wait_for_login(driver: uc.Chrome, timeout: int = 180) -> None:
     """Block until the chat-list is visible (= fully logged in)."""
+    log("Loading WhatsApp Web …")
+
     # Check for QR screen
     try:
-        WebDriverWait(driver, 25).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, S["qr_code"]))
-        )
-        print("┌─────────────────────────────────────────────┐")
-        print("│  Scan the QR code in the browser with your  │")
-        print("│  phone to log in to WhatsApp Web.           │")
-        print("└─────────────────────────────────────────────┘")
+        wait_for_any_selector(driver, QR_CODE_SELECTORS, timeout=25)
+        log("┌─────────────────────────────────────────────┐")
+        log("│  Scan the QR code in the browser with your  │")
+        log("│  phone to log in to WhatsApp Web.           │")
+        log("└─────────────────────────────────────────────┘")
     except TimeoutException:
-        pass  # Already logged in – QR never appeared
+        log("No QR screen detected – checking for an existing session …")
 
-    WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, S["app_ready"]))
-    )
-    print("Session active ✓")
+    wait_for_any_selector(driver, APP_READY_SELECTORS, timeout=timeout)
+    log("Session active ✓")
     jitter(1.5, 2.5)
 
 
@@ -515,30 +590,62 @@ def open_chat(driver: uc.Chrome, name: str) -> bool:
     Type the group name into the search box one character at a time
     (human-like) and click the first matching result.
     """
-    box = driver.find_element(By.CSS_SELECTOR, S["search_box"])
-    box.click()
+    wait_for_any_selector(driver, APP_READY_SELECTORS, timeout=30)
+    box = find_search_input(driver)
+    if box is None:
+        log("  ✗  Could not find the WhatsApp search input.")
+        return False
+
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'}); arguments[0].focus();",
+            box,
+        )
+        box.click()
+    except ElementNotInteractableException:
+        driver.execute_script("arguments[0].focus();", box)
     jitter(0.4, 0.8)
 
+    # Clear any previous query (new UI uses a real <input>)
+    try:
+        box.clear()
+    except Exception:
+        box.send_keys(Keys.CONTROL, "a")
+        box.send_keys(Keys.DELETE)
+
+    log(f"Searching for {name!r} …")
     for ch in name:
         box.send_keys(ch)
         time.sleep(random.uniform(0.04, 0.16))
     jitter(1.0, 1.8)
 
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, S["chat_cell"]))
+        )
+    except TimeoutException:
+        log(f"  ✗  No chat found for {name!r}.")
+        return False
+
     cells = driver.find_elements(By.CSS_SELECTOR, S["chat_cell"])
+    needle = name.lower()
     for cell in cells:
         titles = cell.find_elements(By.CSS_SELECTOR, S["cell_title"])
-        if titles and name.lower() in titles[0].text.lower():
+        if titles and needle in titles[0].text.lower():
+            log(f"Opening chat: {titles[0].text}")
             cell.click()
             jitter(1.2, 2.4)
             return True
 
     if cells:
-        print(f"  ⚠  Exact match not found – clicking first result.")
+        titles = cells[0].find_elements(By.CSS_SELECTOR, S["cell_title"])
+        picked = titles[0].text if titles else "(first result)"
+        log(f"  ⚠  Exact match not found – clicking {picked!r}.")
         cells[0].click()
         jitter(1.2, 2.4)
         return True
 
-    print(f"  ✗  No chat found for '{name}'.")
+    log(f"  ✗  No chat found for {name!r}.")
     return False
 
 
@@ -683,8 +790,8 @@ def _parse_message(driver, row_el, current_date: str,
             return None
 
         # ── direction ─────────────────────────────────────────────────────────
-        # data-id starts with "true_" for outgoing, "false_" for incoming
-        is_out = mid.startswith("true_")
+        # Legacy rows used data-id prefixes; current UI uses tail-out / tail-in.
+        is_out = mid.startswith("true_") or bool(find(row_el, S["tail_out"]))
 
         # ── sender ────────────────────────────────────────────────────────────
         sender    = "You" if is_out else ""
@@ -767,7 +874,7 @@ def scrape_chat(
     )
 
     # ── scroll all the way to the top ────────────────────────────────────────
-    print("↑  Rewinding to the start of history …  (this may take a while)")
+    log("↑  Rewinding to the start of history …  (this may take a while)")
     prev_top  = -1
     stall_n   = 0
     for _ in range(max_top_scrolls):
@@ -795,7 +902,7 @@ def scrape_chat(
         scroll_by(driver, panel, -600)
         jitter(scroll_pause * 0.5, scroll_pause * 1.3)
 
-    print("↓  Reading messages …")
+    log("↓  Reading messages …")
     jitter(1.2, 2.2)
 
     # ── scroll down + collect ─────────────────────────────────────────────────
@@ -855,7 +962,7 @@ def scrape_chat(
         at_bottom     = (scroll_top + client_height) >= (scroll_height - 20)
 
         if at_bottom and no_new_streak >= 4:
-            print(f"\n✓  End of chat reached.  {len(messages)} messages captured.")
+            log(f"\n✓  End of chat reached.  {len(messages)} messages captured.")
             break
 
         scroll_by(driver, panel, random.randint(380, 720))
@@ -904,14 +1011,18 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
+
     driver = build_driver(args.profile_dir)
     try:
         driver.get("https://web.whatsapp.com/")
         wait_for_login(driver)
 
-        print(f"Opening chat: {args.group!r}")
         if not open_chat(driver, args.group):
-            print("Could not open the group.  Exiting.")
+            log("Could not open the group.  Exiting.")
             sys.exit(1)
 
         messages = scrape_chat(
@@ -927,7 +1038,7 @@ def main() -> None:
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        print(f"✓  Saved {len(messages)} messages → {output_path}")
+        log(f"✓  Saved {len(messages)} messages → {output_path}")
 
     finally:
         input("\nPress Enter to close the browser …")
