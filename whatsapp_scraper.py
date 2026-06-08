@@ -349,6 +349,45 @@ function _waFindQuoteBlock(row) {
         || row.querySelector('[data-testid="quoted-msg"]')
         || row.querySelector('[class*="quoted-message"]');
 }
+function _waLooksLikeSender(s) {
+    s = (s || '').trim();
+    if (!s) return false;
+    if (s.length > 48) return false;
+    if (/^https?:\/\//i.test(s)) return false;
+    if (/^\+?[\d\s\-().@]+$/.test(s)) return true;
+    if (s.indexOf('@+') === 0) return true;
+    if ((s.match(/[.!?]/g) || []).length > 1) return false;
+    if (s.length > 28 && (s.indexOf('?') >= 0 || s.indexOf('!') >= 0)) return false;
+    return s.length <= 32;
+}
+function _waCollectBodyTexts(root, quoteBlock, skip) {
+    var results = [];
+    var els = root.querySelectorAll(
+        '[data-testid="selectable-text"], span.selectable-text, span.copyable-text,' +
+        '[data-testid="conversation-text"], span[dir], div[dir]'
+    );
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (quoteBlock && quoteBlock.contains(el)) continue;
+        if (_waInside(el, skip)) continue;
+        var txt = (el.innerText || '').trim();
+        if (!txt || _waLooksLikeTimestamp(txt) || _waLooksLikeStatusGlyph(txt) || _waLooksLikeIconLigature(txt)) continue;
+        results.push({ el: el, txt: txt });
+    }
+    // Drop nested duplicates — keep outermost span only.
+    var outer = [];
+    for (var a = 0; a < results.length; a++) {
+        var nested = false;
+        for (var b = 0; b < results.length; b++) {
+            if (a !== b && results[b].el !== results[a].el && results[b].el.contains(results[a].el)) {
+                nested = true;
+                break;
+            }
+        }
+        if (!nested) outer.push(results[a].txt);
+    }
+    return outer;
+}
 """
 
 _JS_MSG_TEXT = (
@@ -376,18 +415,24 @@ _JS_MSG_TEXT = (
     }
     if (parts.length) return parts.join('\n');
 
-    // Tier 2 — span[dir] (current WhatsApp Web); longest non-chrome span wins.
-    var best = '';
-    var dirSpans = root.querySelectorAll('span[dir="ltr"], span[dir="rtl"], span[dir="auto"]');
-    for (var j = 0; j < dirSpans.length; j++) {
-        var sp = dirSpans[j];
-        if (_waInside(sp, SKIP)) continue;
-        if (quoteBlock && quoteBlock.contains(sp)) continue;
-        var txt = (sp.innerText || '').trim();
-        if (!txt || _waLooksLikeTimestamp(txt) || _waLooksLikeStatusGlyph(txt) || _waLooksLikeIconLigature(txt)) continue;
-        if (txt.length > best.length) best = txt;
+    // Tier 2 — dir spans / divs outside the quote block (join, don't pick longest).
+    var bodyParts = _waCollectBodyTexts(root, quoteBlock, SKIP);
+    if (bodyParts.length) return bodyParts.join('\n');
+
+    // Tier 2b — copyable-text wrapper (body as raw text nodes without dir hints).
+    var copyables = root.querySelectorAll('[data-pre-plain-text], .copyable-text');
+    for (var c = 0; c < copyables.length; c++) {
+        var copy = copyables[c];
+        if (_waInside(copy, SKIP)) continue;
+        var parts = _waCollectBodyTexts(copy, quoteBlock, SKIP);
+        if (parts.length) return parts.join('\n');
+        var raw = _waStripPrePrefix((copy.innerText || '').trim());
+        if (quoteBlock) {
+            var qtxt = (quoteBlock.innerText || '').trim();
+            if (qtxt && raw.indexOf(qtxt) >= 0) raw = raw.replace(qtxt, '').trim();
+        }
+        if (raw && !_waLooksLikeTimestamp(raw)) return raw;
     }
-    if (best) return best;
 
     // Tier 3 — walk descendant text nodes, filter chrome/icons/timestamps.
     var chunks = [];
@@ -404,48 +449,81 @@ _JS_MSG_TEXT = (
     }
     if (chunks.length) return chunks.join(' ').trim();
 
-    // Tier 4 — full row text with data-pre-plain-text prefix stripped.
+    // Tier 4 — full row text minus quote block, with data-pre-plain-text prefix stripped.
     var full = (root.innerText || row.innerText || '').trim();
+    if (quoteBlock) {
+        var qtxt = (quoteBlock.innerText || '').trim();
+        if (qtxt && full.indexOf(qtxt) >= 0) {
+            full = full.replace(qtxt, '').trim();
+        }
+    }
     return _waStripPrePrefix(full);
 })(arguments[0]);
 """
 )
 
-_JS_QUOTE_TEXT = (
+_JS_QUOTE_PARSE = (
     _JS_HELPERS
     + r"""
-(function(block) {
-    var authorEl = block.querySelector('[data-testid="quoted-mention"]')
+(function(row) {
+    var block = _waFindQuoteBlock(row);
+    if (!block) return null;
+
+    var sender = '';
+    var text = '';
+
+    // Explicit author element (short name / phone above the preview).
+    var authorEl = block.querySelector('[data-testid="quoted-author"]');
+    if (authorEl) {
+        sender = (authorEl.innerText || '').trim();
+    }
+
+    // In current WhatsApp Web, quoted-mention holds the quoted MESSAGE TEXT,
+    // not the sender name.  Do NOT treat it as sender.
+    var mentionEl = block.querySelector('[data-testid="quoted-mention"]')
         || block.querySelector('[class*="quoted-mention"]');
-    var authorText = authorEl ? authorEl.innerText.trim() : '';
-
-    var nodes = block.querySelectorAll(
-        '[data-testid="selectable-text"], span.selectable-text, span.copyable-text, [data-testid="conversation-text"]'
-    );
-    var parts = [];
-    for (var i = 0; i < nodes.length; i++) {
-        var t = (nodes[i].innerText || '').trim();
-        if (t && t !== authorText) parts.push(t);
+    if (mentionEl) {
+        var mentionText = (mentionEl.innerText || '').trim();
+        if (mentionText) {
+            if (!text) text = mentionText;
+        }
     }
-    if (parts.length) return parts.join(' ');
 
-    var best = '';
-    var spans = block.querySelectorAll('span[dir="ltr"], span[dir="rtl"], span[dir="auto"]');
-    for (var j = 0; j < spans.length; j++) {
-        var sp = spans[j];
-        if (authorEl && (sp === authorEl || authorEl.contains(sp))) continue;
-        var txt = (sp.innerText || '').trim();
-        if (!txt || txt === authorText) continue;
-        if (_waLooksLikeTimestamp(txt) || _waLooksLikeIconLigature(txt)) continue;
-        if (txt.length > best.length) best = txt;
+    // Fallback: ordered text lines inside the quote preview.
+    if (!text) {
+        var lines = [];
+        var spans = block.querySelectorAll('span[dir], div[dir]');
+        for (var i = 0; i < spans.length; i++) {
+            var sp = spans[i];
+            if (authorEl && (sp === authorEl || authorEl.contains(sp))) continue;
+            if (mentionEl && (sp === mentionEl || mentionEl.contains(sp))) continue;
+            var t = (sp.innerText || '').trim();
+            if (!t || _waLooksLikeTimestamp(t) || _waLooksLikeIconLigature(t)) continue;
+            lines.push(t);
+        }
+        if (lines.length >= 2 && _waLooksLikeSender(lines[0])) {
+            if (!sender) sender = lines[0];
+            text = lines.slice(1).join('\n');
+        } else if (lines.length) {
+            text = lines.join('\n');
+        }
     }
-    if (best) return best;
 
-    var full = (block.innerText || '').trim();
-    if (authorText && full.indexOf(authorText) === 0) {
-        full = full.slice(authorText.length).trim();
+    if (!text) {
+        text = (block.innerText || '').trim();
+        if (sender && text.indexOf(sender) === 0) {
+            text = text.slice(sender.length).trim();
+        }
     }
-    return full;
+
+    // Safety: long / URL / question content belongs in text, never sender.
+    if (sender && !_waLooksLikeSender(sender)) {
+        if (!text) text = sender;
+        sender = '';
+    }
+
+    if (!sender && !text) return null;
+    return { sender: sender, text: text };
 })(arguments[0]);
 """
 )
@@ -459,8 +537,15 @@ _JS_SENDER = (
         return 'You';
     }
 
+    var quoteBlock = _waFindQuoteBlock(row);
+    var QUOTE_SKIP = [
+        '[data-testid="quoted-message"]',
+        '[data-testid="quoted-msg"]',
+        '[class*="quoted-message"]'
+    ];
+
     var author = row.querySelector('[data-testid="author"]');
-    if (author) {
+    if (author && !_waInside(author, QUOTE_SKIP)) {
         var at = (author.innerText || '').trim();
         if (at) return at;
     }
@@ -470,23 +555,27 @@ _JS_SENDER = (
 
     var labelled = row.querySelectorAll('[aria-label]');
     for (var i = 0; i < labelled.length; i++) {
-        var lbl = (labelled[i].getAttribute('aria-label') || '').trim();
+        var el = labelled[i];
+        if (_waInside(el, QUOTE_SKIP)) continue;
+        var lbl = (el.getAttribute('aria-label') || '').trim();
         if (lbl && lbl !== 'You:' && lbl.endsWith(':') && lbl.length > 1) {
-            return lbl.slice(0, -1).trim();
+            var name = lbl.slice(0, -1).trim();
+            if (_waLooksLikeSender(name) || /^\+?[\d\s\-().@]+$/.test(name)) return name;
         }
     }
 
-    // Phone-number / unsaved-contact fallback: first dir=auto span in bubble header.
+    // Header spans: only accept phone numbers or short names, never quote text.
     var container = row.querySelector('[data-testid="msg-container"]') || row;
-    var autoSpans = container.querySelectorAll('span[dir="auto"]');
+    var autoSpans = container.querySelectorAll('span[dir="auto"], span[dir="ltr"], span[dir="rtl"]');
     for (var j = 0; j < autoSpans.length; j++) {
         var sp = autoSpans[j];
-        if (_waInside(sp, ['[data-testid="quoted-message"]', '[data-testid="quoted-msg"]', '[class*="quoted-message"]'])) continue;
+        if (_waInside(sp, QUOTE_SKIP)) continue;
         if (_waInside(sp, ['[data-testid="msg-meta"]'])) continue;
+        if (quoteBlock && quoteBlock.contains(sp)) continue;
         var txt = (sp.innerText || '').trim();
         if (!txt || _waLooksLikeTimestamp(txt) || _waLooksLikeIconLigature(txt)) continue;
-        // Accept phone numbers (+972…), digits-with-dashes, or any short header name.
-        if (/^\+?[\d\s\-().]+$/.test(txt) || txt.length <= 64) return txt;
+        if (/^\+?[\d\s\-().@]+$/.test(txt)) return txt;
+        if (_waLooksLikeSender(txt)) return txt;
     }
 
     return '';
@@ -515,35 +604,61 @@ _JS_REACTIONS = r"""
         return m ? parseInt(m[0], 10) : 1;
     }
 
-    var containers = row.querySelectorAll(
-        '[data-testid="reactions-read-more-container"],' +
-        '[data-testid="reactions-container"],' +
-        '[data-testid="msg-reactions"],' +
-        '[data-testid*="reactions"]'
-    );
+    function scanRoot(root) {
+        if (!root) return;
 
-    for (var c = 0; c < containers.length; c++) {
-        var container = containers[c];
-        var pills = container.querySelectorAll('[role="button"], button, span');
-        for (var p = 0; p < pills.length; p++) {
-            var pill = pills[p];
-            var txt = (pill.innerText || pill.textContent || '').trim();
-            if (!txt) continue;
-            var emoji = firstEmoji(txt);
-            if (!emoji) continue;
-            var count = parseCount(txt.replace(emoji, ''));
-            if (count < 1) count = 1;
-            add(emoji, count);
+        var containers = root.querySelectorAll(
+            '[data-testid="reactions-read-more-container"],' +
+            '[data-testid="reactions-container"],' +
+            '[data-testid="msg-reactions"],' +
+            '[data-testid="reactions-bubble"],' +
+            '[data-testid*="reaction"]'
+        );
+        for (var c = 0; c < containers.length; c++) {
+            var container = containers[c];
+            var pills = container.querySelectorAll('[role="button"], button, span, div');
+            for (var p = 0; p < pills.length; p++) {
+                var pill = pills[p];
+                var txt = (pill.innerText || pill.textContent || '').trim();
+                if (!txt) continue;
+                var emoji = firstEmoji(txt);
+                if (!emoji) continue;
+                var count = parseCount(txt.replace(emoji, ''));
+                if (count < 1) count = 1;
+                add(emoji, count);
+            }
+        }
+
+        // Emoji-only spans (e.g. "👍" or "👍2") sitting on the message row.
+        var spans = root.querySelectorAll('span');
+        for (var s = 0; s < spans.length; s++) {
+            var sp = spans[s];
+            if (sp.closest('[data-testid="quoted-message"], [data-testid="msg-meta"], [data-testid="author"]')) continue;
+            var st = (sp.innerText || '').trim();
+            if (!st || st.length > 8) continue;
+            var em = firstEmoji(st);
+            if (!em) continue;
+            if (st.replace(em, '').trim().match(/^\d*$/)) {
+                add(em, parseCount(st.replace(em, '')));
+            }
+        }
+
+        var labelled = root.querySelectorAll('[aria-label]');
+        for (var i = 0; i < labelled.length; i++) {
+            var lbl = (labelled[i].getAttribute('aria-label') || '').trim();
+            if (!lbl) continue;
+            var low = lbl.toLowerCase();
+            if (low.indexOf('reaction') < 0 && lbl.indexOf('תגוב') < 0 && lbl.indexOf('הגיב') < 0) continue;
+            var emoji = firstEmoji(lbl);
+            if (emoji) add(emoji, parseCount(lbl));
         }
     }
 
-    var labelled = row.querySelectorAll('[aria-label]');
-    for (var i = 0; i < labelled.length; i++) {
-        var lbl = (labelled[i].getAttribute('aria-label') || '').trim();
-        if (!lbl || (lbl.toLowerCase().indexOf('reaction') < 0 && lbl.indexOf('תגוב') < 0)) continue;
-        var emoji = firstEmoji(lbl);
-        if (emoji) add(emoji, parseCount(lbl));
-    }
+    // Reactions may live on the row, its parent wrapper, or a sibling of msg-container.
+    scanRoot(row);
+    if (row.parentElement) scanRoot(row.parentElement);
+    var container = row.querySelector('[data-testid="msg-container"]');
+    if (container && container.parentElement) scanRoot(container.parentElement);
 
     return results;
 })(arguments[0]);
@@ -927,37 +1042,84 @@ def open_chat(driver: uc.Chrome, name: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _looks_like_sender(name: str) -> bool:
+    """Heuristic: distinguish a contact name/phone from message body text."""
+    s = name.strip()
+    if not s or len(s) > 48:
+        return False
+    if re.match(r"^https?://", s, re.I):
+        return False
+    if re.match(r"^\+?[\d\s\-().@]+$", s):
+        return True
+    if s.startswith("@+"):
+        return True
+    if len(s) > 28 and ("?" in s or "!" in s):
+        return False
+    if len(re.findall(r"[.!?]", s)) > 1:
+        return False
+    return len(s) <= 32
+
+
+def _normalize_quote(quote: Optional[Quote]) -> Optional[Quote]:
+    """Move mis-assigned quote body text out of quote.sender."""
+    if quote is None:
+        return None
+    sender, text = quote.sender.strip(), quote.text.strip()
+    if sender and not text and not _looks_like_sender(sender):
+        return Quote(sender="", text=sender)
+    if sender and text and sender == text:
+        return Quote(sender="", text=text)
+    return Quote(sender=sender, text=text)
+
+
+def _strip_quote_from_text(text: str, quote: Optional[Quote]) -> str:
+    """Remove quoted preview text that leaked into the message body."""
+    if not quote or not text:
+        return text
+    for blob in (quote.text, quote.sender):
+        if not blob:
+            continue
+        if text == blob:
+            return ""
+        if text.startswith(blob):
+            text = text[len(blob):].strip()
+        if text.endswith(blob):
+            text = text[:-len(blob)].strip()
+    return text
+
+
 def _parse_quote(driver, row_el) -> Optional[Quote]:
     """
     Extract the quoted / replied-to message block.
-    Uses JS (_JS_QUOTE_TEXT) so Hebrew, English, and mixed quote text
-    are all read correctly without span double-counting.
+    In current WhatsApp Web, quoted-mention holds the preview TEXT, not the sender.
     """
+    try:
+        raw = driver.execute_script(_JS_QUOTE_PARSE, row_el)
+        if raw:
+            return _normalize_quote(Quote(
+                sender=(raw.get("sender") or "").strip(),
+                text=(raw.get("text") or "").strip(),
+            ))
+    except Exception:
+        pass
+
     block = _find_quote_block(row_el)
     if block is None:
         return None
 
-    # Sender of the quoted message (the coloured mention span)
-    author_el = find(block, S["quote_author"]) or find(block, '[class*="quoted-mention"]')
-    q_sender  = author_el.text.strip() if author_el else ""
+    mention_el = find(block, S["quote_author"]) or find(block, '[class*="quoted-mention"]')
+    author_el  = find(block, '[data-testid="quoted-author"]')
+    q_sender   = author_el.text.strip() if author_el else ""
+    q_text     = mention_el.text.strip() if mention_el else ""
 
-    # Text of the quoted message
-    try:
-        q_text = driver.execute_script(_JS_QUOTE_TEXT, block)
-        q_text = (q_text or "").strip()
-    except Exception:
-        q_text = ""
-        for sp in find_all(block, 'span[dir="ltr"], span[dir="rtl"], span[dir="auto"]'):
+    if not q_text:
+        for sp in find_all(block, 'span[dir="ltr"], span[dir="rtl"], span[dir="auto"], div[dir]'):
             t = sp.text.strip()
             if t and t != q_sender and not re.match(r"^\d{1,2}:\d{2}", t):
                 q_text = t
                 break
 
-    # Strip sender name if it was accidentally prepended to the text
-    if q_sender and q_text.startswith(q_sender):
-        q_text = q_text[len(q_sender):].strip()
-
-    return Quote(sender=q_sender, text=q_text) if (q_sender or q_text) else None
+    return _normalize_quote(Quote(sender=q_sender, text=q_text)) if (q_sender or q_text) else None
 
 
 def _parse_reactions_basic(driver, row_el) -> List[Reaction]:
@@ -1093,14 +1255,7 @@ def _parse_message(driver, row_el, current_date: str,
 
         # ── text ──────────────────────────────────────────────────────────────
         text = _extract_text(driver, row_el)
-
-        # If quote text leaked into body (DOM drift), recover the reply body.
-        if quote and quote.text and text == quote.text:
-            text = ""
-        elif quote and quote.text and text.startswith(quote.text):
-            text = text[len(quote.text):].strip()
-        if quote and quote.sender and text == quote.sender:
-            text = ""
+        text = _strip_quote_from_text(text, quote)
 
         # ── media type ────────────────────────────────────────────────────────
         media_type = None
