@@ -67,10 +67,44 @@ class ReactionExtractor:
                 except StaleElementReferenceException as exc:
                     last_err = exc
 
-            for el in self.driver.find_elements(By.CSS_SELECTOR, S["rxn_dialog"]):
+            dialog_candidates = self.driver.find_elements(
+                By.CSS_SELECTOR, S["rxn_dialog"]
+            )
+            for el in reversed(dialog_candidates):
                 try:
-                    if el.is_displayed():
+                    if not el.is_displayed():
+                        continue
+                    if self.driver.execute_script(
+                        _JS_HAS_REACTION_PARTICIPANTS, el
+                    ):
                         return el
+                except StaleElementReferenceException as exc:
+                    last_err = exc
+
+            detail_cells = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                (
+                    '[data-testid="reactions-details-cell-not-me"],'
+                    '[data-testid="reactions-details-cell-me"],'
+                    '[role="listitem"][aria-label*="reacted"]'
+                ),
+            )
+            for el in reversed(detail_cells):
+                try:
+                    dialog = self.driver.execute_script(
+                        """
+                        var el = arguments[0];
+                        return (
+                            el.closest('[role="dialog"]')
+                            || el.closest('[role="list"]')
+                            || el.closest('[data-testid="drawer-right"]')
+                            || el
+                        );
+                        """,
+                        el,
+                    )
+                    if dialog and dialog.is_displayed():
+                        return dialog
                 except StaleElementReferenceException as exc:
                     last_err = exc
             time.sleep(0.15)
@@ -157,6 +191,15 @@ class ReactionExtractor:
                         continue
                 except StaleElementReferenceException:
                     continue
+
+                aria = (row.get_attribute("aria-label") or "").strip()
+                reacted = re.match(r"^(.+?)\s+reacted\s+with\b", aria, re.I)
+                if reacted:
+                    n = reacted.group(1).strip()
+                    if n and n not in seen and not re.fullmatch(r"\d+", n):
+                        seen.add(n)
+                        senders.append(n)
+                        continue
 
                 for name_el in find_all(row, S["rxn_name"]):
                     n = (name_el.get_attribute("title") or name_el.text or "").strip()

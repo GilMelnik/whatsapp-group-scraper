@@ -85,16 +85,25 @@ S: Dict[str, str] = {
         '[data-testid="reactions-container"],'
         '[data-testid="msg-reactions"]'
     ),
-    "rxn_dialog":    '[data-testid="reactions-list"]',
+    "rxn_dialog":    (
+        '[data-testid="reactions-list"],'
+        '[role="dialog"],'
+        '[role="list"]'
+    ),
     "rxn_tab":       '[data-testid="reactions-tab"]',
     "rxn_name":      (
         '[data-testid="react-participant"],'
         '[data-testid="reactions-list-item"],'
+        '[data-testid="reactions-details-cell-not-me"],'
+        '[data-testid="reactions-details-cell-me"],'
         '[data-testid="cell-frame-title"]'
     ),
     "rxn_row":       (
         '[data-testid="react-participant"],'
         '[data-testid="reactions-list-item"],'
+        '[data-testid="reactions-details-cell-not-me"],'
+        '[data-testid="reactions-details-cell-me"],'
+        '[role="listitem"][aria-label*="reacted"],'
         '[role="listitem"],'
         '[data-testid="cell-frame-container"]'
     ),
