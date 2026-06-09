@@ -59,8 +59,10 @@ Notes
     human-like timing and random-step scrolling.
   • WhatsApp Web uses a virtual list – rows outside the viewport are removed
     from the DOM, so messages are harvested progressively as you scroll.
-  • --reactions-detail clicks every reaction pill to read who reacted; this
-    is noticeably slower.  Without this flag only emoji + count are recorded.
+  • --reactions-detail clicks reaction pills during the downward scroll to
+    record who reacted; this is noticeably slower than emoji + count only.
+  • The scraper performs one upward scroll to reach history start, then one
+    downward scroll that harvests everything currently in the DOM.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -202,7 +204,17 @@ S: Dict[str, str] = {
     ),
     "rxn_dialog":    '[data-testid="reactions-list"]',
     "rxn_tab":       '[data-testid="reactions-tab"]',
-    "rxn_name":      '[data-testid="react-participant"]',
+    "rxn_name":      (
+        '[data-testid="react-participant"],'
+        '[data-testid="reactions-list-item"],'
+        '[data-testid="cell-frame-title"]'
+    ),
+    "rxn_row":       (
+        '[data-testid="react-participant"],'
+        '[data-testid="reactions-list-item"],'
+        '[role="listitem"],'
+        '[data-testid="cell-frame-container"]'
+    ),
     "rxn_pill":      (
         '[data-testid="reaction-bubble"],'
         '[data-testid="reactions-bubble"] [role="button"],'
@@ -230,6 +242,12 @@ MEDIA_CHECKS: List[tuple] = [
     ("gif",      S["m_gif"]),
     ("location", S["m_location"]),
 ]
+
+# Date separators plus every row shape WhatsApp uses in the virtual list.
+CHAT_ITEM_SELECTOR = (
+    f'{S["date_card"]}, {S["message_row"]}, '
+    'div.focusable-list-item[data-id]'
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -715,13 +733,56 @@ _JS_COLLECT_REACTORS = r"""
 return (function(dialog) {
     var names = [];
     var seen = {};
-    function collect(root) {
-        var els = root.querySelectorAll('[data-testid="react-participant"]');
-        for (var i = 0; i < els.length; i++) {
-            var n = (els[i].innerText || els[i].textContent || '').trim();
-            if (n && !seen[n]) { seen[n] = true; names.push(n); }
+
+    function isTab(el) {
+        return !!(el && el.closest(
+            '[data-testid="reactions-tab"], [role="tab"], [role="tablist"]'
+        ));
+    }
+
+    function addName(n) {
+        n = (n || '').trim();
+        if (!n || seen[n]) return;
+        if (/^\d+$/.test(n)) return;
+        if (/^(All|הכל)$/i.test(n)) return;
+        if (/^[\p{Extended_Pictographic}\p{Emoji}\u200d\uFE0F\s·•]+$/u.test(n)) return;
+        seen[n] = true;
+        names.push(n);
+    }
+
+    function nameFromRow(el) {
+        if (!el || isTab(el)) return;
+        var picks = el.querySelectorAll(
+            '[data-testid="react-participant"],' +
+            '[data-testid="cell-frame-title"],' +
+            'span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]'
+        );
+        for (var i = 0; i < picks.length; i++) {
+            var pick = picks[i];
+            if (isTab(pick)) continue;
+            var n = (pick.getAttribute('title') || pick.innerText || pick.textContent || '').trim();
+            if (n && n.length < 120) { addName(n); return; }
+        }
+        var lines = (el.innerText || el.textContent || '').split('\n');
+        for (var j = 0; j < lines.length; j++) {
+            var line = lines[j].trim();
+            if (line) { addName(line); return; }
         }
     }
+
+    function collect(root) {
+        if (!root) return;
+        var rows = root.querySelectorAll(
+            '[data-testid="react-participant"],' +
+            '[data-testid="reactions-list-item"],' +
+            '[role="listitem"],' +
+            '[data-testid="cell-frame-container"]'
+        );
+        for (var i = 0; i < rows.length; i++) {
+            nameFromRow(rows[i]);
+        }
+    }
+
     var scrollEl = dialog.querySelector('[data-testid="scrollable-content"]')
         || dialog.querySelector('[data-scrolltraceid]')
         || dialog.querySelector('[role="list"]')
@@ -822,6 +883,41 @@ def find_all(el, css: str) -> list:
         return el.find_elements(By.CSS_SELECTOR, css)
     except (NoSuchElementException, StaleElementReferenceException):
         return []
+
+
+def _normalize_emoji(value: str) -> str:
+    """Strip variation selectors so ❤ and ❤️ compare equal."""
+    if not value:
+        return ""
+    return re.sub(r"[\uFE0E\uFE0F\u200D]", "", value)
+
+
+def _emoji_matches(left: str, right: str) -> bool:
+    """Return True when two strings refer to the same reaction emoji."""
+    left_n  = _normalize_emoji(left)
+    right_n = _normalize_emoji(right)
+    if not left_n or not right_n:
+        return False
+    return left_n in right_n or right_n in left_n
+
+
+def _wait_for_reaction_dialog(driver, timeout: float = 8.0):
+    """Wait until WhatsApp's reactions drawer is visible."""
+    deadline = time.time() + timeout
+    last_err: Optional[Exception] = None
+    while time.time() < deadline:
+        for sel in (S["rxn_dialog"], '[data-testid="drawer-right"]'):
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    dialog = find(el, S["rxn_dialog"]) or el
+                    if dialog.is_displayed():
+                        return dialog
+                except StaleElementReferenceException as exc:
+                    last_err = exc
+        time.sleep(0.15)
+    raise TimeoutException("Reaction dialog did not appear") from last_err
 
 
 def _message_id(row_el) -> str:
@@ -1260,7 +1356,9 @@ def _collect_reaction_senders(driver, dialog) -> List[str]:
     """Scroll the reactions popup and collect every participant name."""
     try:
         names = driver.execute_script(_JS_COLLECT_REACTORS, dialog) or []
-        return [str(n).strip() for n in names if str(n).strip()]
+        cleaned = [str(n).strip() for n in names if str(n).strip()]
+        if cleaned:
+            return cleaned
     except Exception:
         pass
 
@@ -1273,11 +1371,27 @@ def _collect_reaction_senders(driver, dialog) -> List[str]:
     )
 
     for _ in range(40):
-        for name_el in find_all(dialog, S["rxn_name"]):
-            n = name_el.text.strip()
-            if n and n not in seen:
-                seen.add(n)
-                senders.append(n)
+        for row in find_all(dialog, S["rxn_row"]):
+            try:
+                role = (row.get_attribute("role") or "").lower()
+                testid = row.get_attribute("data-testid") or ""
+                if role == "tab" or testid == "reactions-tab":
+                    continue
+            except StaleElementReferenceException:
+                continue
+
+            for name_el in find_all(row, S["rxn_name"]):
+                n = (name_el.get_attribute("title") or name_el.text or "").strip()
+                if n and n not in seen:
+                    seen.add(n)
+                    senders.append(n)
+
+            if not find_all(row, S["rxn_name"]):
+                for sp in find_all(row, 'span[title], span[dir="auto"]'):
+                    n = (sp.get_attribute("title") or sp.text or "").strip()
+                    if n and n not in seen and not re.fullmatch(r"\d+", n):
+                        seen.add(n)
+                        senders.append(n)
 
         try:
             prev = driver.execute_script("return arguments[0].scrollTop;", scroll_el)
@@ -1316,7 +1430,7 @@ def _find_reaction_pill(row_el, emoji: str):
             try:
                 txt  = pill.text.strip()
                 aria = (pill.get_attribute("aria-label") or "").strip()
-                if emoji in txt or emoji in aria:
+                if _emoji_matches(emoji, txt) or _emoji_matches(emoji, aria):
                     return pill
             except StaleElementReferenceException:
                 continue
@@ -1325,7 +1439,7 @@ def _find_reaction_pill(row_el, emoji: str):
             for pill in find_all(container, '[data-testid="reaction-bubble"]'):
                 try:
                     aria = (pill.get_attribute("aria-label") or "").strip()
-                    if emoji in pill.text.strip() or emoji in aria:
+                    if _emoji_matches(emoji, pill.text.strip()) or _emoji_matches(emoji, aria):
                         return pill
                 except StaleElementReferenceException:
                     continue
@@ -1333,7 +1447,7 @@ def _find_reaction_pill(row_el, emoji: str):
         for container in find_all(scope, S["rxn_container"]):
             for pill in find_all(container, '[role="button"], button'):
                 try:
-                    if emoji in pill.text.strip():
+                    if _emoji_matches(emoji, pill.text.strip()):
                         return pill
                 except StaleElementReferenceException:
                     continue
@@ -1347,17 +1461,6 @@ def _dismiss_reaction_dialog(driver) -> None:
         jitter(0.15, 0.3)
     except Exception:
         pass
-
-
-def _has_reaction_pills(row_el) -> bool:
-    """Return True when the row currently shows at least one reaction pill."""
-    scope = _reaction_scope(row_el)
-    if find(scope, S["rxn_pill"]) or find(scope, '[data-testid="reaction-bubble"]'):
-        return True
-    for container in find_all(scope, S["rxn_container"]):
-        if find(container, '[role="button"], button'):
-            return True
-    return False
 
 
 def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
@@ -1378,19 +1481,20 @@ def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
         if target_pill:
             try:
                 driver.execute_script("arguments[0].click();", target_pill)
-                jitter(0.4, 0.8)
+                jitter(0.45, 0.9)
 
-                dialog = WebDriverWait(driver, 6).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, S["rxn_dialog"]))
-                )
+                dialog = _wait_for_reaction_dialog(driver)
 
                 tabs = find_all(dialog, S["rxn_tab"])
-                for tab in tabs:
-                    if rxn.emoji in tab.text:
-                        driver.execute_script("arguments[0].click();", tab)
-                        jitter(0.2, 0.4)
-                        break
+                if len(tabs) > 1:
+                    for tab in tabs:
+                        tab_text = tab.text.strip()
+                        if _emoji_matches(rxn.emoji, tab_text):
+                            driver.execute_script("arguments[0].click();", tab)
+                            jitter(0.25, 0.45)
+                            break
 
+                jitter(0.2, 0.4)
                 senders = _collect_reaction_senders(driver, dialog)
                 _dismiss_reaction_dialog(driver)
 
@@ -1403,101 +1507,12 @@ def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
     return detailed
 
 
-def _enrich_reactions_detail(
+def _parse_message(
     driver,
-    panel,
-    messages: Dict[str, Message],
-    scroll_pause: float = 1.0,
-    max_passes: int = 4000,
-) -> None:
-    """
-    Second pass: scroll the chat and click reaction pills for messages that
-    already have basic emoji/count data.  Kept separate from the main harvest
-    loop so reaction popups never hijack the scroll position.
-    """
-    pending = {
-        mid for mid, msg in messages.items()
-        if msg.reactions and not any(r.senders for r in msg.reactions)
-    }
-    if not pending:
-        return
-
-    log(f"☺  Collecting who reacted ({len(pending)} messages) …")
-    driver.execute_script("arguments[0].scrollTop = 0;", panel)
-    jitter(1.0, 1.8)
-    wait_no_spinner(driver, panel)
-
-    enriched: set = set()
-    no_progress = 0
-    max_scroll_top = 0
-
-    for pass_n in range(1, max_passes + 1):
-        wait_no_spinner(driver, panel)
-        progress = 0
-
-        try:
-            rows = panel.find_elements(By.CSS_SELECTOR, S["message_row"])
-        except StaleElementReferenceException:
-            panel = driver.find_element(By.CSS_SELECTOR, S["panel"])
-            rows = panel.find_elements(By.CSS_SELECTOR, S["message_row"])
-
-        for row in rows:
-            try:
-                mid = _message_id(row)
-                if not mid or mid not in pending or mid in enriched:
-                    continue
-                if not _has_reaction_pills(row):
-                    continue
-
-                scope = _reaction_scope(row)
-                detailed = _parse_reactions_detail(driver, scope)
-                messages[mid].reactions = detailed
-                enriched.add(mid)
-                progress += 1
-            except StaleElementReferenceException:
-                continue
-
-        if progress:
-            no_progress = 0
-            if pass_n == 1 or pass_n % 10 == 0:
-                log(f"  ☺ pass {pass_n}: {len(enriched)}/{len(pending)} detailed")
-        else:
-            no_progress += 1
-
-        scroll_top = driver.execute_script("return arguments[0].scrollTop;", panel)
-        scroll_height = driver.execute_script("return arguments[0].scrollHeight;", panel)
-        client_height = driver.execute_script("return arguments[0].clientHeight;", panel)
-        max_scroll_top = max(max_scroll_top, scroll_top)
-        at_bottom = (scroll_top + client_height) >= (scroll_height - 20)
-
-        if len(enriched) >= len(pending):
-            log(f"  ☺ reaction details complete ({len(enriched)} messages)")
-            break
-
-        if at_bottom and no_progress >= 8:
-            log(
-                f"  ☺ reaction pass finished at bottom "
-                f"({len(enriched)}/{len(pending)} detailed)"
-            )
-            break
-
-        if no_progress >= 20 and scroll_top >= max_scroll_top - 40:
-            log(
-                f"  ☺ reaction pass stalled "
-                f"({len(enriched)}/{len(pending)} detailed)"
-            )
-            break
-
-        scroll_by(driver, panel, random.randint(180, 320))
-        jitter(scroll_pause * 0.4, scroll_pause * 0.9)
-    else:
-        log(
-            f"  ⚠ reaction detail pass limit reached "
-            f"({len(enriched)}/{len(pending)} detailed)"
-        )
-
-
-def _parse_message(driver, row_el, current_date: str) -> Optional[Message]:
+    row_el,
+    current_date: str,
+    reactions_detail: bool = False,
+) -> Optional[Message]:
     """
     Parse a single message row into a Message dataclass.
     Each field is read from its own DOM zone — never from combined row text.
@@ -1549,7 +1564,11 @@ def _parse_message(driver, row_el, current_date: str) -> Optional[Message]:
         if not sender and not text and media_type is None:
             return None
 
-        reactions = _parse_reactions_basic(driver, _reaction_scope(row_el))
+        scope = _reaction_scope(row_el)
+        if reactions_detail:
+            reactions = _parse_reactions_detail(driver, scope)
+        else:
+            reactions = _parse_reactions_basic(driver, scope)
 
         return Message(
             id          = mid,
@@ -1572,18 +1591,104 @@ def _parse_message(driver, row_el, current_date: str) -> Optional[Message]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _panel_items(panel):
+    """Return date cards and message rows currently in the DOM."""
+    try:
+        return panel.find_elements(By.CSS_SELECTOR, CHAT_ITEM_SELECTOR)
+    except StaleElementReferenceException:
+        return []
+
+
+def _harvest_visible_messages(
+    driver,
+    panel,
+    messages: Dict[str, Message],
+    current_date: str,
+    reactions_detail: bool,
+) -> tuple[int, str]:
+    """Parse visible rows; return (new_count, updated_current_date)."""
+    added = 0
+
+    for item in _panel_items(panel):
+        try:
+            testid = item.get_attribute("data-testid") or ""
+            if testid == "msg-dateseparator":
+                raw = item.text.strip()
+                if raw:
+                    current_date = normalize_date(raw)
+                continue
+
+            if testid == "msg-container":
+                row_el = item
+            elif item.get_attribute("data-id"):
+                row_el = find(item, S["message_row"]) or item
+            else:
+                continue
+
+            msg = _parse_message(
+                driver, row_el, current_date, reactions_detail=reactions_detail
+            )
+            if msg and msg.id not in messages:
+                messages[msg.id] = msg
+                added += 1
+
+        except StaleElementReferenceException:
+            continue
+
+    return added, current_date
+
+
+def _scroll_to_top(
+    driver,
+    panel,
+    scroll_pause: float,
+    max_steps: int,
+) -> None:
+    """Single upward scroll until the oldest loaded history is reached."""
+    prev_top = -1
+    stall_n  = 0
+
+    for step in range(1, max_steps + 1):
+        wait_no_spinner(driver, panel)
+        top = driver.execute_script("return arguments[0].scrollTop;", panel)
+
+        if step == 1 or step % 20 == 0:
+            log(f"  ↑ scrollTop={top}")
+
+        if top == 0:
+            jitter(0.8, 1.5)
+            wait_no_spinner(driver, panel)
+            if driver.execute_script("return arguments[0].scrollTop;", panel) == 0:
+                log(f"  ↑ reached top ({step} steps)")
+                return
+
+        if top == prev_top:
+            stall_n += 1
+            jitter(1.5, 2.5)
+            wait_no_spinner(driver, panel)
+            if stall_n >= 3:
+                log(f"  ↑ top of loaded history (scrollTop={top})")
+                return
+        else:
+            stall_n = 0
+
+        prev_top = top
+        scroll_by(driver, panel, -random.randint(450, 750))
+        jitter(scroll_pause * 0.25, scroll_pause * 0.6)
+
+
 def scrape_chat(
     driver:           uc.Chrome,
     scroll_pause:     float = 1.0,
     max_top_scrolls:  int   = 6000,
-    max_down_passes:  int   = 2500,
+    max_down_passes:  int   = 10,
     reactions_detail: bool  = False,
 ) -> List[Message]:
     """
     1. Wait for the message panel.
-    2. Scroll to the very beginning of the chat history.
-    3. Scroll downward, harvesting messages as they appear.
-    4. Stop when we have been at the bottom with no new messages for a few passes.
+    2. One upward scroll to the start of history.
+    3. One downward scroll, harvesting messages (and reactors) as they appear.
+    4. Stop when the bottom is reached with no new messages.
     """
 
     # ── wait for panel ────────────────────────────────────────────────────────
@@ -1591,87 +1696,47 @@ def scrape_chat(
         EC.presence_of_element_located((By.CSS_SELECTOR, S["panel"]))
     )
 
-    # ── scroll all the way to the top ────────────────────────────────────────
-    log("↑  Rewinding to the start of history …  (this may take a while)")
-    prev_top  = -1
-    stall_n   = 0
-    up_pass   = 0
-    for up_pass in range(1, max_top_scrolls + 1):
+    # ── single upward scroll ──────────────────────────────────────────────────
+    log("↑  Rewinding to the start of history …")
+    _scroll_to_top(driver, panel, scroll_pause, max_top_scrolls)
+
+    if reactions_detail:
+        log("↓  Reading messages and collecting reactors …")
+    else:
+        log("↓  Reading messages …")
+    jitter(0.8, 1.4)
+
+    # ── single downward scroll + harvest ────────────────────────────────────────
+    messages:           Dict[str, Message] = {}
+    current_date:       str = datetime.today().strftime("%d/%m/%Y")
+    no_new_streak       = 0
+    step_n              = 0
+    last_scroll_top     = -1
+    same_scroll_streak  = 0
+    max_scroll_top      = 0
+
+    while step_n < max_down_passes:
+        step_n += 1
         wait_no_spinner(driver, panel)
-        top = driver.execute_script("return arguments[0].scrollTop;", panel)
 
-        if up_pass == 1 or up_pass % 25 == 0:
-            log(f"  ↑ pass {up_pass}, scrollTop={top}")
-
-        if top == 0:
-            jitter(1.0, 1.8)
-            wait_no_spinner(driver, panel)
-            if driver.execute_script("return arguments[0].scrollTop;", panel) == 0:
-                log(f"  ↑ reached top after {up_pass} passes")
-                break
-
-        if top == prev_top:
-            stall_n += 1
-            jitter(2.0, 3.5)
-            wait_no_spinner(driver, panel)
-            if stall_n >= 4:
-                log(f"  ↑ stop rewind (stall at scrollTop={top})")
-                break
-        else:
-            stall_n = 0
-
-        prev_top = top
-        scroll_by(driver, panel, -600)
-        jitter(scroll_pause * 0.5, scroll_pause * 1.3)
-
-    log("↓  Reading messages …")
-    jitter(1.2, 2.2)
-
-    # ── scroll down + collect ─────────────────────────────────────────────────
-    messages:       Dict[str, Message] = {}
-    current_date:   str = datetime.today().strftime("%d/%m/%Y")
-    no_new_streak   = 0
-    pass_n          = 0
-    last_scroll_top = -1
-    same_scroll_streak = 0
-    max_scroll_top  = 0
-
-    while pass_n < max_down_passes:
-        pass_n += 1
         try:
-            items = panel.find_elements(
-                By.CSS_SELECTOR,
-                f'{S["date_card"]}, {S["message_row"]}'
+            added, current_date = _harvest_visible_messages(
+                driver,
+                panel,
+                messages,
+                current_date,
+                reactions_detail,
             )
         except StaleElementReferenceException:
             panel = driver.find_element(By.CSS_SELECTOR, S["panel"])
-            items = panel.find_elements(
-                By.CSS_SELECTOR,
-                f'{S["date_card"]}, {S["message_row"]}'
+            added, current_date = _harvest_visible_messages(
+                driver,
+                panel,
+                messages,
+                current_date,
+                reactions_detail,
             )
 
-        before = len(messages)
-
-        for item in items:
-            try:
-                testid = item.get_attribute("data-testid") or ""
-                if testid == "msg-dateseparator":
-                    raw = item.text.strip()
-                    if raw:
-                        current_date = normalize_date(raw)
-                    continue
-
-                if testid != "msg-container":
-                    continue
-
-                msg = _parse_message(driver, item, current_date)
-                if msg and msg.id not in messages:
-                    messages[msg.id] = msg
-
-            except StaleElementReferenceException:
-                continue
-
-        added = len(messages) - before
         no_new_streak = 0 if added else no_new_streak + 1
 
         scroll_top    = driver.execute_script("return arguments[0].scrollTop;", panel)
@@ -1686,26 +1751,26 @@ def scrape_chat(
             same_scroll_streak = 0
         last_scroll_top = scroll_top
 
-        if pass_n == 1 or pass_n % 10 == 0 or added:
+        if step_n == 1 or step_n % 15 == 0 or added:
             log(
-                f"  ↓ pass {pass_n}: {len(messages)} total"
+                f"  ↓ step {step_n}: {len(messages)} total"
                 f" (+{added} new), scrollTop={scroll_top}"
             )
 
-        if at_bottom and no_new_streak >= 3:
+        if at_bottom and no_new_streak >= 8:
             log(f"\n✓  End of chat reached.  {len(messages)} messages captured.")
             break
 
-        if same_scroll_streak >= 6 and no_new_streak >= 3:
+        if same_scroll_streak >= 10 and no_new_streak >= 6:
             log(
                 f"\n✓  Scroll stalled near end.  {len(messages)} messages captured."
             )
             break
 
         if (
-            no_new_streak >= 10
-            and scroll_top >= max_scroll_top - 60
-            and pass_n > 5
+            no_new_streak >= 15
+            and scroll_top >= max_scroll_top - 40
+            and step_n > 8
         ):
             log(
                 f"\n✓  No new messages near bottom.  "
@@ -1713,17 +1778,14 @@ def scrape_chat(
             )
             break
 
-        scroll_by(driver, panel, random.randint(220, 420))
-        jitter(scroll_pause * 0.6, scroll_pause * 1.4)
+        scroll_by(driver, panel, random.randint(90, 160))
+        jitter(scroll_pause * 0.35, scroll_pause * 0.75)
 
     else:
         log(
-            f"\n⚠  Stopped after {max_down_passes} down-scroll passes.  "
+            f"\n⚠  Stopped after {max_down_passes} down-scroll steps.  "
             f"{len(messages)} messages captured."
         )
-
-    if reactions_detail:
-        _enrich_reactions_detail(driver, panel, messages, scroll_pause)
 
     return list(messages.values())
 
