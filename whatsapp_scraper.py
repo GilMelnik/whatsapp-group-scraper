@@ -36,7 +36,7 @@ Captured fields
   • is_outgoing  – true if YOU sent the message
   • quote        – sender + text of the replied-to message, or null
   • reactions    – list of { emoji, count, senders[] }
-                   senders is populated only with --reactions-detail
+                   senders lists who reacted (disable with --no-reactions-detail)
   • media_type   – "image" | "video" | "audio" | "sticker" | "document"
                    "gif" | "location" | null
 
@@ -48,7 +48,7 @@ Usage
 ─────
   python whatsapp_scraper.py --group "My Group"
   python whatsapp_scraper.py --group "Team Chat" --output team.json
-  python whatsapp_scraper.py --group "Team Chat" --reactions-detail
+  python whatsapp_scraper.py --group "Team Chat" --no-reactions-detail
   python whatsapp_scraper.py --group "Team Chat" --scroll-pause 1.5
 
 Notes
@@ -59,10 +59,9 @@ Notes
     human-like timing and random-step scrolling.
   • WhatsApp Web uses a virtual list – rows outside the viewport are removed
     from the DOM, so messages are harvested progressively as you scroll.
-  • --reactions-detail clicks reaction pills during the downward scroll to
-    record who reacted; this is noticeably slower than emoji + count only.
-  • The scraper performs one upward scroll to reach history start, then one
-    downward scroll that harvests everything currently in the DOM.
+  • Reactor names are collected by default by opening the reactions drawer.
+  • --no-reactions-detail skips reactor lookup (emoji + count only, faster).
+  • Scrolling uses visible message row heights so the harvest pass does not skip rows.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -751,73 +750,228 @@ return (function(row) {
 )
 
 _JS_COLLECT_REACTORS = r"""
-return (function(dialog) {
+return (function(dialog, targetEmoji) {
     var names = [];
     var seen = {};
+    targetEmoji = targetEmoji || '';
 
+    function normEmoji(s) {
+        return (s || '').replace(/[\uFE0E\uFE0F\u200D]/g, '');
+    }
+    function emojiMatches(left, right) {
+        left = normEmoji(left);
+        right = normEmoji(right);
+        if (!left || !right) return !right;
+        return left.indexOf(right) >= 0 || right.indexOf(left) >= 0;
+    }
+    function firstEmoji(s) {
+        var m = (s || '').match(/\p{Extended_Pictographic}/u);
+        return m ? m[0] : '';
+    }
     function isTab(el) {
         return !!(el && el.closest(
             '[data-testid="reactions-tab"], [role="tab"], [role="tablist"]'
         ));
     }
-
+    function badName(n) {
+        n = (n || '').trim();
+        if (!n || n.length > 120) return true;
+        if (/^\d+$/.test(n)) return true;
+        if (/^(All|הכל)$/i.test(n)) return true;
+        if (/^[\p{Extended_Pictographic}\p{Emoji}\u200d\uFE0F\s·•,]+$/u.test(n)) return true;
+        return false;
+    }
     function addName(n) {
         n = (n || '').trim();
-        if (!n || seen[n]) return;
-        if (/^\d+$/.test(n)) return;
-        if (/^(All|הכל)$/i.test(n)) return;
-        if (/^[\p{Extended_Pictographic}\p{Emoji}\u200d\uFE0F\s·•]+$/u.test(n)) return;
+        if (badName(n) || seen[n]) return;
         seen[n] = true;
         names.push(n);
     }
-
+    function rowEmoji(el) {
+        if (!el) return '';
+        var img = el.querySelector('[data-testid="reaction-bubble-item"] img[alt], img[alt]');
+        if (img) {
+            var alt = (img.getAttribute('alt') || '').trim();
+            if (alt) return firstEmoji(alt) || alt;
+        }
+        var btn = el.querySelector('[data-testid="reaction-bubble"], [aria-label]');
+        if (btn) {
+            var lbl = btn.getAttribute('aria-label') || btn.textContent || '';
+            var em = firstEmoji(lbl);
+            if (em) return em;
+        }
+        return firstEmoji(el.innerText || el.textContent || '');
+    }
     function nameFromRow(el) {
         if (!el || isTab(el)) return;
-        var picks = el.querySelectorAll(
-            '[data-testid="react-participant"],' +
-            '[data-testid="cell-frame-title"],' +
-            'span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]'
+        var em = rowEmoji(el);
+        if (targetEmoji && em && !emojiMatches(em, targetEmoji)) return;
+
+        var titleEl = el.querySelector(
+            '[data-testid="react-participant"] [data-testid="cell-frame-title"] span[title],'
+            + '[data-testid="react-participant"] span[title],'
+            + '[data-testid="cell-frame-title"] span[title],'
+            + '[data-testid="cell-frame-title"] span[dir],'
+            + '[data-testid="react-participant"]'
         );
+        if (titleEl) {
+            var n = (titleEl.getAttribute('title')
+                || titleEl.innerText
+                || titleEl.textContent
+                || '').trim();
+            if (!badName(n)) { addName(n); return; }
+        }
+
+        var picks = el.querySelectorAll('span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]');
         for (var i = 0; i < picks.length; i++) {
             var pick = picks[i];
             if (isTab(pick)) continue;
-            var n = (pick.getAttribute('title') || pick.innerText || pick.textContent || '').trim();
-            if (n && n.length < 120) { addName(n); return; }
+            if (pick.closest('[data-testid="reactions-tab"], [role="tablist"]')) continue;
+            n = (pick.getAttribute('title') || pick.innerText || pick.textContent || '').trim();
+            if (!badName(n)) { addName(n); return; }
         }
+
         var lines = (el.innerText || el.textContent || '').split('\n');
         for (var j = 0; j < lines.length; j++) {
             var line = lines[j].trim();
-            if (line) { addName(line); return; }
+            if (!badName(line)) { addName(line); return; }
         }
     }
-
     function collect(root) {
         if (!root) return;
         var rows = root.querySelectorAll(
-            '[data-testid="react-participant"],' +
-            '[data-testid="reactions-list-item"],' +
-            '[role="listitem"],' +
-            '[data-testid="cell-frame-container"]'
+            '[data-testid="react-participant"],'
+            + '[data-testid="reactions-list-item"],'
+            + '[role="listitem"],'
+            + '[data-testid="cell-frame-container"]'
         );
         for (var i = 0; i < rows.length; i++) {
             nameFromRow(rows[i]);
         }
     }
 
-    var scrollEl = dialog.querySelector('[data-testid="scrollable-content"]')
-        || dialog.querySelector('[data-scrolltraceid]')
-        || dialog.querySelector('[role="list"]')
+    var root = dialog.closest('[data-testid="drawer-right"]') || dialog;
+    var scrollEl = root.querySelector('[data-testid="scrollable-content"]')
+        || root.querySelector('[data-scrolltraceid]')
+        || root.querySelector('[data-testid="reactions-list"] [role="list"]')
+        || root.querySelector('[role="list"]')
+        || root.querySelector('[data-testid="reactions-list"]')
         || dialog;
     collect(scrollEl);
     var lastTop = -1;
-    for (var attempt = 0; attempt < 40; attempt++) {
-        scrollEl.scrollTop += 180;
+    for (var attempt = 0; attempt < 50; attempt++) {
+        scrollEl.scrollTop += Math.max(120, Math.floor(scrollEl.clientHeight * 0.6));
         if (scrollEl.scrollTop === lastTop) break;
         lastTop = scrollEl.scrollTop;
         collect(scrollEl);
     }
     return names;
+})(arguments[0], arguments[1]);
+"""
+
+_JS_PANEL_METRICS = r"""
+return (function(panel) {
+    var panelRect = panel.getBoundingClientRect();
+    var rows = panel.querySelectorAll('div.focusable-list-item[data-id], [data-testid="msg-container"]');
+    var visible = [];
+    var maxBottom = -Infinity;
+    var minTop = Infinity;
+    var anchorBottom = null;
+
+    for (var i = 0; i < rows.length; i++) {
+        var el = rows[i];
+        var rect = el.getBoundingClientRect();
+        if (rect.bottom <= panelRect.top + 1) continue;
+        if (rect.top >= panelRect.bottom - 1) continue;
+
+        var dataId = el.getAttribute('data-id') || '';
+        if (!dataId) {
+            var inner = el.querySelector('[data-id]');
+            if (inner) dataId = inner.getAttribute('data-id') || '';
+        }
+        var relTop = rect.top - panelRect.top;
+        var relBottom = rect.bottom - panelRect.top;
+        visible.push({
+            id: dataId,
+            top: relTop,
+            bottom: relBottom,
+            height: rect.height
+        });
+        if (relBottom > maxBottom) {
+            maxBottom = relBottom;
+            anchorBottom = relBottom;
+        }
+        if (relTop < minTop) minTop = relTop;
+    }
+
+    return {
+        scrollTop: panel.scrollTop,
+        scrollHeight: panel.scrollHeight,
+        clientHeight: panel.clientHeight,
+        visibleCount: visible.length,
+        anchorBottom: anchorBottom,
+        anchorTop: minTop === Infinity ? null : minTop,
+        atBottom: panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 8,
+        atTop: panel.scrollTop <= 1,
+        visible: visible
+    };
 })(arguments[0]);
+"""
+
+_JS_PANEL_SCROLL = r"""
+return (function(panel, direction, overlap) {
+    overlap = overlap || 28;
+    direction = direction || 'down';
+    var panelRect = panel.getBoundingClientRect();
+    var rows = panel.querySelectorAll('div.focusable-list-item[data-id], [data-testid="msg-container"]');
+    var prevTop = panel.scrollTop;
+    var delta = 0;
+
+    if (direction === 'down') {
+        var maxBottom = -Infinity;
+        for (var i = 0; i < rows.length; i++) {
+            var el = rows[i];
+            var rect = el.getBoundingClientRect();
+            if (rect.bottom <= panelRect.top + 1) continue;
+            if (rect.top >= panelRect.bottom - 1) continue;
+            var relBottom = rect.bottom - panelRect.top;
+            if (relBottom > maxBottom) maxBottom = relBottom;
+        }
+        if (maxBottom > -Infinity) {
+            delta = Math.max(12, maxBottom - overlap);
+        } else {
+            delta = Math.max(48, Math.floor(panel.clientHeight * 0.45));
+        }
+        panel.scrollTop += delta;
+    } else {
+        var minTop = Infinity;
+        for (var j = 0; j < rows.length; j++) {
+            el = rows[j];
+            rect = el.getBoundingClientRect();
+            if (rect.bottom <= panelRect.top + 1) continue;
+            if (rect.top >= panelRect.bottom - 1) continue;
+            var relTop = rect.top - panelRect.top;
+            if (relTop < minTop) minTop = relTop;
+        }
+        if (minTop < Infinity) {
+            delta = Math.max(12, minTop + overlap);
+        } else {
+            delta = Math.max(48, Math.floor(panel.clientHeight * 0.45));
+        }
+        panel.scrollTop -= delta;
+        if (panel.scrollTop < 0) panel.scrollTop = 0;
+    }
+
+    var scrolled = panel.scrollTop - prevTop;
+    return {
+        scrolled: scrolled,
+        delta: delta,
+        scrollTop: panel.scrollTop,
+        atBottom: panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 8,
+        atTop: panel.scrollTop <= 1,
+        stuck: Math.abs(scrolled) < 1
+    };
+})(arguments[0], arguments[1], arguments[2]);
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -875,6 +1029,35 @@ def find_search_input(driver) -> Optional[object]:
     return None
 
 
+def _panel_scroll(
+    driver,
+    panel,
+    direction: str = "down",
+    overlap: int = 28,
+) -> dict:
+    """Scroll the message panel by visible row pixel height (no random jumps)."""
+    try:
+        result = driver.execute_script(
+            _JS_PANEL_SCROLL, panel, direction, overlap
+        )
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    return {"scrolled": 0, "stuck": True, "atBottom": False, "atTop": False}
+
+
+def _panel_metrics(driver, panel) -> dict:
+    """Return scroll metrics and visible row geometry for the message panel."""
+    try:
+        result = driver.execute_script(_JS_PANEL_METRICS, panel)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    return {}
+
+
 def scroll_by(driver, el, px: int, step: int = 120) -> None:
     """
     Scroll a DOM element by `px` pixels in small, randomised increments
@@ -927,16 +1110,22 @@ def _wait_for_reaction_dialog(driver, timeout: float = 8.0):
     deadline = time.time() + timeout
     last_err: Optional[Exception] = None
     while time.time() < deadline:
-        for sel in (S["rxn_dialog"], '[data-testid="drawer-right"]'):
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                try:
-                    if not el.is_displayed():
-                        continue
-                    dialog = find(el, S["rxn_dialog"]) or el
-                    if dialog.is_displayed():
-                        return dialog
-                except StaleElementReferenceException as exc:
-                    last_err = exc
+        for drawer in driver.find_elements(By.CSS_SELECTOR, '[data-testid="drawer-right"]'):
+            try:
+                if not drawer.is_displayed():
+                    continue
+                dialog = find(drawer, S["rxn_dialog"]) or drawer
+                if dialog.is_displayed():
+                    return dialog
+            except StaleElementReferenceException as exc:
+                last_err = exc
+
+        for el in driver.find_elements(By.CSS_SELECTOR, S["rxn_dialog"]):
+            try:
+                if el.is_displayed():
+                    return el
+            except StaleElementReferenceException as exc:
+                last_err = exc
         time.sleep(0.15)
     raise TimeoutException("Reaction dialog did not appear") from last_err
 
@@ -1691,10 +1880,14 @@ def _parse_reactions_basic(driver, row_el) -> List[Reaction]:
     return results
 
 
-def _collect_reaction_senders(driver, dialog) -> List[str]:
-    """Scroll the reactions popup and collect every participant name."""
+def _collect_reaction_senders(
+    driver,
+    dialog,
+    emoji: str = "",
+) -> List[str]:
+    """Scroll the reactions popup and collect participant names."""
     try:
-        names = driver.execute_script(_JS_COLLECT_REACTORS, dialog) or []
+        names = driver.execute_script(_JS_COLLECT_REACTORS, dialog, emoji) or []
         cleaned = [str(n).strip() for n in names if str(n).strip()]
         if cleaned:
             return cleaned
@@ -1703,14 +1896,25 @@ def _collect_reaction_senders(driver, dialog) -> List[str]:
 
     senders: List[str] = []
     seen: set = set()
+    root = dialog
+    try:
+        drawer = dialog.find_element(
+            By.XPATH,
+            "./ancestor::*[@data-testid='drawer-right'][1]",
+        )
+        root = drawer
+    except (NoSuchElementException, StaleElementReferenceException):
+        pass
+
     scroll_el = (
-        find(dialog, S["rxn_scroll"])
-        or find(dialog, '[role="list"]')
-        or dialog
+        find(root, S["rxn_scroll"])
+        or find(root, '[role="list"]')
+        or find(root, S["rxn_dialog"])
+        or root
     )
 
-    for _ in range(40):
-        for row in find_all(dialog, S["rxn_row"]):
+    for _ in range(50):
+        for row in find_all(root, S["rxn_row"]):
             try:
                 role = (row.get_attribute("role") or "").lower()
                 testid = row.get_attribute("data-testid") or ""
@@ -1721,7 +1925,7 @@ def _collect_reaction_senders(driver, dialog) -> List[str]:
 
             for name_el in find_all(row, S["rxn_name"]):
                 n = (name_el.get_attribute("title") or name_el.text or "").strip()
-                if n and n not in seen:
+                if n and n not in seen and not re.fullmatch(r"\d+", n):
                     seen.add(n)
                     senders.append(n)
 
@@ -1734,15 +1938,59 @@ def _collect_reaction_senders(driver, dialog) -> List[str]:
 
         try:
             prev = driver.execute_script("return arguments[0].scrollTop;", scroll_el)
-            driver.execute_script("arguments[0].scrollTop += 180;", scroll_el)
+            driver.execute_script(
+                "arguments[0].scrollTop += Math.max(120, arguments[0].clientHeight * 0.6);",
+                scroll_el,
+            )
             cur = driver.execute_script("return arguments[0].scrollTop;", scroll_el)
             if cur == prev:
                 break
         except Exception:
             break
-        jitter(0.15, 0.35)
+        jitter(0.1, 0.25)
 
     return senders
+
+
+def _find_reaction_click_target(row_el, emoji: str):
+    """Locate the element to click to open the reactions drawer."""
+    pill = _find_reaction_pill(row_el, emoji)
+    if pill:
+        return pill
+
+    scopes = [row_el]
+    try:
+        scopes.append(row_el.find_element(By.XPATH, ".."))
+    except (NoSuchElementException, StaleElementReferenceException):
+        pass
+    try:
+        scopes.append(
+            row_el.find_element(
+                By.XPATH,
+                "./ancestor::div[contains(@class,'focusable-list-item')]",
+            )
+        )
+    except (NoSuchElementException, StaleElementReferenceException):
+        pass
+
+    seen = set()
+    for scope in scopes:
+        if id(scope) in seen:
+            continue
+        seen.add(id(scope))
+
+        for sel in (
+            '[data-testid="reactions-read-more-container"]',
+            '[data-testid="addon-bubble-container"]',
+            S["rxn_container"],
+        ):
+            for target in find_all(scope, sel):
+                try:
+                    if target.is_displayed():
+                        return target
+                except StaleElementReferenceException:
+                    continue
+    return None
 
 
 def _find_reaction_pill(row_el, emoji: str):
@@ -1802,6 +2050,30 @@ def _dismiss_reaction_dialog(driver) -> None:
         pass
 
 
+def _click_reaction_tab(driver, dialog, emoji: str) -> None:
+    """Select the emoji tab inside the reactions drawer when present."""
+    tabs = find_all(dialog, S["rxn_tab"])
+    if not tabs:
+        tabs = find_all(dialog, '[role="tab"]')
+    if not tabs:
+        return
+
+    for tab in tabs:
+        try:
+            tab_text = (
+                tab.get_attribute("aria-label")
+                or tab.get_attribute("title")
+                or tab.text
+                or ""
+            ).strip()
+            if _emoji_matches(emoji, tab_text):
+                driver.execute_script("arguments[0].click();", tab)
+                jitter(0.25, 0.45)
+                return
+        except StaleElementReferenceException:
+            continue
+
+
 def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
     """
     Click each reaction pill to open the 'who reacted' dialog, scroll the
@@ -1815,26 +2087,21 @@ def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
 
     for rxn in basic:
         senders: List[str] = []
-        target_pill = _find_reaction_pill(row_el, rxn.emoji)
+        target = _find_reaction_click_target(row_el, rxn.emoji)
 
-        if target_pill:
+        if target:
             try:
-                driver.execute_script("arguments[0].click();", target_pill)
+                driver.execute_script("arguments[0].click();", target)
                 jitter(0.45, 0.9)
 
                 dialog = _wait_for_reaction_dialog(driver)
-
-                tabs = find_all(dialog, S["rxn_tab"])
-                if len(tabs) > 1:
-                    for tab in tabs:
-                        tab_text = tab.text.strip()
-                        if _emoji_matches(rxn.emoji, tab_text):
-                            driver.execute_script("arguments[0].click();", tab)
-                            jitter(0.25, 0.45)
-                            break
-
+                _click_reaction_tab(driver, dialog, rxn.emoji)
                 jitter(0.2, 0.4)
-                senders = _collect_reaction_senders(driver, dialog)
+                senders = _collect_reaction_senders(driver, dialog, rxn.emoji)
+
+                if not senders and rxn.count == 1:
+                    senders = _collect_reaction_senders(driver, dialog, "")
+
                 _dismiss_reaction_dialog(driver)
 
             except (TimeoutException, StaleElementReferenceException,
@@ -1984,24 +2251,27 @@ def _scroll_to_top(
     max_steps: int,
 ) -> None:
     """Single upward scroll until the oldest loaded history is reached."""
-    prev_top = -1
-    stall_n  = 0
+    stall_n = 0
 
     for step in range(1, max_steps + 1):
         wait_no_spinner(driver, panel)
-        top = driver.execute_script("return arguments[0].scrollTop;", panel)
+        metrics = _panel_metrics(driver, panel)
+        top = metrics.get("scrollTop", 0)
 
         if step == 1 or step % 20 == 0:
-            log(f"  ↑ scrollTop={top}")
+            visible = metrics.get("visibleCount", 0)
+            log(f"  ↑ scrollTop={top}, visible={visible}")
 
-        if top == 0:
+        if metrics.get("atTop") or top == 0:
             jitter(0.8, 1.5)
             wait_no_spinner(driver, panel)
-            if driver.execute_script("return arguments[0].scrollTop;", panel) == 0:
+            metrics = _panel_metrics(driver, panel)
+            if metrics.get("atTop") or metrics.get("scrollTop", 0) == 0:
                 log(f"  ↑ reached top ({step} steps)")
                 return
 
-        if top == prev_top:
+        result = _panel_scroll(driver, panel, "up")
+        if result.get("stuck"):
             stall_n += 1
             jitter(1.5, 2.5)
             wait_no_spinner(driver, panel)
@@ -2011,8 +2281,6 @@ def _scroll_to_top(
         else:
             stall_n = 0
 
-        prev_top = top
-        scroll_by(driver, panel, -random.randint(450, 750))
         jitter(scroll_pause * 0.25, scroll_pause * 0.6)
 
 
@@ -2021,12 +2289,12 @@ def scrape_chat(
     scroll_pause:     float = 1.0,
     max_top_scrolls:  int   = 6000,
     max_down_passes:  int   = 10,
-    reactions_detail: bool  = False,
+    reactions_detail: bool  = True,
 ) -> List[Message]:
     """
     1. Wait for the message panel.
     2. One upward scroll to the start of history.
-    3. One downward scroll, harvesting messages (and reactors) as they appear.
+    3. One downward pass, harvesting messages as each viewport window loads.
     4. Stop when the bottom is reached with no new messages.
     """
 
@@ -2045,14 +2313,13 @@ def scrape_chat(
         log("↓  Reading messages …")
     jitter(0.8, 1.4)
 
-    # ── single downward scroll + harvest ────────────────────────────────────────
+    # ── pixel-based downward scroll + harvest ─────────────────────────────────
     messages:           Dict[str, Message] = {}
     current_date:       str = datetime.today().strftime("%d/%m/%Y")
     no_new_streak       = 0
     step_n              = 0
-    last_scroll_top     = -1
-    same_scroll_streak  = 0
-    max_scroll_top      = 0
+    stall_streak        = 0
+    prev_message_count  = 0
 
     while step_n < max_down_passes:
         step_n += 1
@@ -2076,40 +2343,48 @@ def scrape_chat(
                 reactions_detail,
             )
 
-        no_new_streak = 0 if added else no_new_streak + 1
-
-        scroll_top    = driver.execute_script("return arguments[0].scrollTop;", panel)
-        scroll_height = driver.execute_script("return arguments[0].scrollHeight;", panel)
-        client_height = driver.execute_script("return arguments[0].clientHeight;", panel)
-        max_scroll_top = max(max_scroll_top, scroll_top)
-        at_bottom      = (scroll_top + client_height) >= (scroll_height - 20)
-
-        if scroll_top == last_scroll_top:
-            same_scroll_streak += 1
+        if added:
+            no_new_streak = 0
         else:
-            same_scroll_streak = 0
-        last_scroll_top = scroll_top
+            no_new_streak += 1
+
+        metrics = _panel_metrics(driver, panel)
+        scroll_top    = metrics.get("scrollTop", 0)
+        scroll_height = metrics.get("scrollHeight", 0)
+        client_height = metrics.get("clientHeight", 0)
+        visible_n     = metrics.get("visibleCount", 0)
+        at_bottom     = metrics.get("atBottom", False)
 
         if step_n == 1 or step_n % 15 == 0 or added:
             log(
                 f"  ↓ step {step_n}: {len(messages)} total"
-                f" (+{added} new), scrollTop={scroll_top}"
+                f" (+{added} new), visible={visible_n}, scrollTop={scroll_top}"
             )
 
-        if at_bottom and no_new_streak >= 8:
+        if at_bottom and no_new_streak >= 5:
+            _harvest_visible_messages(
+                driver, panel, messages, current_date, reactions_detail,
+            )
             log(f"\n✓  End of chat reached.  {len(messages)} messages captured.")
             break
 
-        if same_scroll_streak >= 10 and no_new_streak >= 6:
+        scroll_result = _panel_scroll(driver, panel, "down")
+        if scroll_result.get("stuck"):
+            stall_streak += 1
+        else:
+            stall_streak = 0
+
+        if stall_streak >= 8 and no_new_streak >= 5:
             log(
                 f"\n✓  Scroll stalled near end.  {len(messages)} messages captured."
             )
             break
 
         if (
-            no_new_streak >= 15
-            and scroll_top >= max_scroll_top - 40
-            and step_n > 8
+            no_new_streak >= 12
+            and at_bottom
+            and len(messages) == prev_message_count
+            and step_n > 6
         ):
             log(
                 f"\n✓  No new messages near bottom.  "
@@ -2117,7 +2392,7 @@ def scrape_chat(
             )
             break
 
-        scroll_by(driver, panel, random.randint(90, 160))
+        prev_message_count = len(messages)
         jitter(scroll_pause * 0.35, scroll_pause * 0.75)
 
     else:
@@ -2125,6 +2400,12 @@ def scrape_chat(
             f"\n⚠  Stopped after {max_down_passes} down-scroll steps.  "
             f"{len(messages)} messages captured."
         )
+
+    added, current_date = _harvest_visible_messages(
+        driver, panel, messages, current_date, reactions_detail,
+    )
+    if added:
+        log(f"  Final viewport harvest: +{added} messages")
 
     return list(messages.values())
 
@@ -2165,8 +2446,9 @@ def main() -> None:
         help="Max downward scroll passes when reading messages (default: 2500).",
     )
     ap.add_argument(
-        "--reactions-detail", action="store_true",
-        help="Click each reaction pill to record who reacted (slower).",
+        "--no-reactions-detail",
+        action="store_true",
+        help="Skip opening reaction drawers (emoji + count only, faster).",
     )
     args = ap.parse_args()
 
@@ -2189,7 +2471,7 @@ def main() -> None:
             scroll_pause     = args.scroll_pause,
             max_top_scrolls  = args.max_top_scrolls,
             max_down_passes  = args.max_down_passes,
-            reactions_detail = args.reactions_detail,
+            reactions_detail = not args.no_reactions_detail,
         )
 
         output_path = Path(args.output)
