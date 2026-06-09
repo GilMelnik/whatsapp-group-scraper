@@ -166,6 +166,27 @@ SEARCH_INPUT_SELECTORS: List[str] = [
     '[data-testid="chat-list-search"]',         # legacy container
 ]
 
+# Search-result rows live inside this panel — not the main chat list behind it.
+SEARCH_RESULTS_ROOT_SELECTORS: List[str] = [
+    '#pane-side [aria-label*="Search results"]',
+    '#pane-side [aria-label*="search results"]',
+    '#pane-side [aria-label*="תוצאות"]',          # Hebrew UI
+    '[data-testid="chat-list"]',
+    '#pane-side',
+]
+
+CONV_HEADER_TITLE_SELECTORS: List[str] = [
+    '#main header [data-testid="conversation-info-header-chat-title"] span[title]',
+    '#main header [data-testid="conversation-info-header-chat-title"] span',
+    '#main header [data-testid="conversation-info-header"] span[title]',
+]
+
+COMPOSE_BOX_SELECTORS: List[str] = [
+    '[data-testid="conversation-compose-box-input"]',
+    '#main footer div[contenteditable="true"]',
+    'footer div[contenteditable="true"][data-tab="10"]',
+]
+
 S: Dict[str, str] = {
     # ── login ──────────────────────────────────────────────────────────────────
     "qr_code":       '[data-testid="qrcode"]',
@@ -1198,11 +1219,345 @@ def wait_for_login(driver: uc.Chrome, timeout: int = 180) -> None:
 #  Chat navigation
 # ══════════════════════════════════════════════════════════════════════════════
 
+_JS_SEARCH_RESULT_CELLS = r"""
+var roots = arguments[0];
+var root = null;
+for (var r = 0; r < roots.length; r++) {
+    root = document.querySelector(roots[r]);
+    if (root) break;
+}
+if (!root) return [];
+
+// WhatsApp keyboard focus walks [role="option"] rows in visual order.
+var options = root.querySelectorAll('[role="option"]');
+if (options.length) return Array.from(options);
+
+// Fallback: outermost chat rows only (skip nested cell-frame-container copies).
+var containers = root.querySelectorAll('[data-testid="cell-frame-container"]');
+var outer = [];
+for (var i = 0; i < containers.length; i++) {
+    var c = containers[i];
+    var nested = false;
+    var par = c.parentElement;
+    while (par && par !== root) {
+        if (par.getAttribute && par.getAttribute('data-testid') === 'cell-frame-container') {
+            nested = true;
+            break;
+        }
+        par = par.parentElement;
+    }
+    if (!nested) outer.push(c);
+}
+return outer;
+"""
+
+_JS_CELL_CHAT_TITLE = r"""
+var cell = arguments[0];
+function looksLikeUnread(s) {
+    s = (s || '').trim();
+    if (!s) return true;
+    if (/^\d+$/.test(s)) return true;
+    if (/unread/i.test(s)) return true;
+    return false;
+}
+function pickTitle(text, attr) {
+    attr = (attr || '').trim();
+    text = (text || '').trim();
+    if (attr && !looksLikeUnread(attr)) return attr;
+    if (text && !looksLikeUnread(text)) return text;
+    return '';
+}
+
+var frame = cell.querySelector('[data-testid="cell-frame-title"]');
+if (frame) {
+    var titled = frame.querySelector('span[title]');
+    if (titled) {
+        var fromTitled = pickTitle(titled.textContent, titled.getAttribute('title'));
+        if (fromTitled) return fromTitled;
+    }
+    var spans = frame.querySelectorAll('span');
+    for (var i = 0; i < spans.length; i++) {
+        var sp = spans[i];
+        if (sp.closest('[data-icon], .wds-icon, [aria-label*="unread"]')) continue;
+        var picked = pickTitle(sp.textContent, sp.getAttribute('title'));
+        if (picked) return picked;
+    }
+}
+
+var any = cell.querySelectorAll('span[title]');
+for (var j = 0; j < any.length; j++) {
+    var el = any[j];
+    if (el.closest('[data-icon], .wds-icon, [data-testid="icon-unread-count"], [aria-label*="unread"]')) continue;
+    var a = pickTitle(el.textContent, el.getAttribute('title'));
+    if (a) return a;
+}
+return '';
+"""
+
+_JS_READ_HEADER_TITLE = r"""
+var header = document.querySelector('#main header [data-testid="conversation-info-header"]')
+    || document.querySelector('#main header');
+if (!header) return '';
+
+function badTitle(s) {
+    s = (s || '').trim();
+    if (!s) return true;
+    if (/click here for group info/i.test(s)) return true;
+    if (/^\+\d/.test(s)) return true;
+    if (/\d+\s+more$/i.test(s)) return true;
+    if ((s.match(/,/g) || []).length >= 3) return true;
+    if (s.length > 100) return true;
+    return false;
+}
+
+var zones = [
+    '[data-testid="conversation-info-header-chat-title"]',
+    '[data-testid="cell-frame-title"]'
+];
+for (var z = 0; z < zones.length; z++) {
+    var box = header.querySelector(zones[z]);
+    if (!box) continue;
+    var sp = box.querySelector('span[title]') || box.querySelector('span');
+    if (!sp) continue;
+    var t = (sp.getAttribute('title') || sp.textContent || '').trim();
+    if (!badTitle(t)) return t;
+}
+
+var best = '';
+var spans = header.querySelectorAll('span[title]');
+for (var i = 0; i < spans.length; i++) {
+    var el = spans[i];
+    if (el.closest('.wds-icon, [data-icon]')) continue;
+    var t = (el.getAttribute('title') || '').trim();
+    if (badTitle(t)) continue;
+    if (!best || t.length < best.length) best = t;
+}
+return best;
+"""
+
+_HEADER_GARBAGE_RE = re.compile(
+    r"click here for group info|\+\d{1,3}[\s\-]?\d|\d+\s+more$",
+    re.IGNORECASE,
+)
+
+
+def _norm_chat_name(value: str) -> str:
+    """Normalise a chat title for comparison (case + whitespace)."""
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def _cell_chat_title(driver, cell) -> str:
+    """Read the chat title from a search-result row (prefers span[title])."""
+    try:
+        title = driver.execute_script(_JS_CELL_CHAT_TITLE, cell)
+        if title:
+            return str(title).strip()
+    except Exception:
+        pass
+
+    for sel in ('span[title]', S["cell_title"]):
+        for el in cell.find_elements(By.CSS_SELECTOR, sel):
+            attr = (el.get_attribute("title") or "").strip()
+            if attr:
+                return attr
+            text = (el.text or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _find_search_result_cells(driver) -> List[object]:
+    """Return top-level search rows in WhatsApp visual / keyboard order."""
+    try:
+        cells = driver.execute_script(
+            _JS_SEARCH_RESULT_CELLS,
+            SEARCH_RESULTS_ROOT_SELECTORS,
+        )
+        if cells:
+            return list(cells)
+    except Exception:
+        pass
+
+    root = None
+    for sel in SEARCH_RESULTS_ROOT_SELECTORS:
+        found = driver.find_elements(By.CSS_SELECTOR, sel)
+        if found:
+            root = found[0]
+            break
+
+    if root is None:
+        return []
+
+    cells = root.find_elements(By.CSS_SELECTOR, '[role="option"]')
+    if cells:
+        return cells
+
+    return root.find_elements(By.CSS_SELECTOR, S["chat_cell"])
+
+
+def _looks_like_header_garbage(title: str) -> bool:
+    """True for participant lists, phone numbers, and other non-title header text."""
+    t = (title or "").strip()
+    if not t or t.startswith("wds-"):
+        return True
+    if _HEADER_GARBAGE_RE.search(t):
+        return True
+    if t.count(",") >= 3 or len(t) > 100:
+        return True
+    return False
+
+
+def _read_open_chat_title(driver) -> str:
+    """Return the chat/group name from the conversation header."""
+    try:
+        title = driver.execute_script(_JS_READ_HEADER_TITLE)
+        if title and not _looks_like_header_garbage(str(title)):
+            return str(title).strip()
+    except Exception:
+        pass
+
+    for sel in CONV_HEADER_TITLE_SELECTORS:
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            title = (el.get_attribute("title") or el.text or "").strip()
+            if title and not _looks_like_header_garbage(title):
+                return title
+    return ""
+
+
+def _compose_box_visible(driver) -> bool:
+    """True when the message compose box is visible (chat is really open)."""
+    for sel in COMPOSE_BOX_SELECTORS:
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            try:
+                if el.is_displayed():
+                    return True
+            except StaleElementReferenceException:
+                continue
+    return False
+
+
+def _wait_for_chat_open(driver, name: str, timeout: float = 20) -> bool:
+    """Block until the conversation footer appears."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _compose_box_visible(driver):
+            opened = _read_open_chat_title(driver)
+            if opened and not _chat_title_matches(name, opened):
+                log(f"  ⚠  Header shows {opened!r}, wanted {name!r}")
+                return False
+            return True
+
+        opened = _read_open_chat_title(driver)
+        if opened and _chat_title_matches(name, opened):
+            jitter(0.4, 0.8)
+            if _compose_box_visible(driver):
+                return True
+
+        time.sleep(0.25)
+    return False
+
+
+def _open_first_exact_search_result(driver, name: str) -> bool:
+    """Click the first search row whose title exactly matches `name`."""
+    needle = _norm_chat_name(name)
+    for idx, cell in enumerate(_find_search_result_cells(driver)):
+        title = _cell_chat_title(driver, cell)
+        if _norm_chat_name(title) != needle:
+            continue
+
+        log(f"Opening chat: {title!r}")
+        _click_search_result(driver, cell, title)
+        if _wait_for_chat_open(driver, name):
+            log("  Chat open ✓")
+            return True
+
+        log(f"  ⚠  Chat did not open for {name!r}")
+        return False
+
+    return False
+
+
+def _chat_title_matches(wanted: str, opened: str) -> bool:
+    """Return True when the opened header matches the requested chat name."""
+    w = _norm_chat_name(wanted)
+    o = _norm_chat_name(opened)
+    if not w or not o:
+        return False
+    return w == o or w in o or o in w
+
+
+def _click_search_result(driver, cell, title: str) -> None:
+    """Click the titled span inside a search row (most reliable target)."""
+    target = cell
+    try:
+        row = driver.execute_script(
+            'return arguments[0].closest(\'[role="option"]\') || arguments[0];',
+            cell,
+        )
+        if row:
+            target = row
+    except Exception:
+        pass
+
+    try:
+        titled = driver.execute_script(
+            """
+            var root = arguments[0];
+            var needle = arguments[1].toLowerCase().trim();
+            var spans = root.querySelectorAll(
+                '[data-testid="cell-frame-title"] span, span[title]'
+            );
+            for (var i = 0; i < spans.length; i++) {
+                var sp = spans[i];
+                var t = (sp.getAttribute('title') || sp.textContent || '')
+                    .replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (t === needle) return sp;
+            }
+            return null;
+            """,
+            target,
+            title,
+        )
+        if titled:
+            target = titled
+    except Exception:
+        pass
+
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center'});", target)
+    jitter(0.25, 0.45)
+
+    clicked = False
+    for attempt in (
+        lambda: target.click(),
+        lambda: ActionChains(driver).move_to_element(target).click().perform(),
+        lambda: driver.execute_script("arguments[0].click();", target),
+    ):
+        try:
+            attempt()
+            clicked = True
+            break
+        except Exception:
+            continue
+
+    if not clicked:
+        driver.execute_script(
+            """
+            var el = arguments[0];
+            ['mousedown', 'mouseup', 'click'].forEach(function(type) {
+                el.dispatchEvent(new MouseEvent(type, {
+                    bubbles: true, cancelable: true, view: window
+                }));
+            });
+            """,
+            target,
+        )
+    jitter(0.8, 1.4)
+
 
 def open_chat(driver: uc.Chrome, name: str) -> bool:
     """
-    Type the group name into the search box one character at a time
-    (human-like) and click the first matching result.
+    Type the group name into the search box and open the first exact match.
     """
     wait_for_any_selector(driver, APP_READY_SELECTORS, timeout=30)
     box = find_search_input(driver)
@@ -1220,7 +1575,6 @@ def open_chat(driver: uc.Chrome, name: str) -> bool:
         driver.execute_script("arguments[0].focus();", box)
     jitter(0.4, 0.8)
 
-    # Clear any previous query (new UI uses a real <input>)
     try:
         box.clear()
     except Exception:
@@ -1241,25 +1595,10 @@ def open_chat(driver: uc.Chrome, name: str) -> bool:
         log(f"  ✗  No chat found for {name!r}.")
         return False
 
-    cells = driver.find_elements(By.CSS_SELECTOR, S["chat_cell"])
-    needle = name.lower()
-    for cell in cells:
-        titles = cell.find_elements(By.CSS_SELECTOR, S["cell_title"])
-        if titles and needle in titles[0].text.lower():
-            log(f"Opening chat: {titles[0].text}")
-            cell.click()
-            jitter(1.2, 2.4)
-            return True
-
-    if cells:
-        titles = cells[0].find_elements(By.CSS_SELECTOR, S["cell_title"])
-        picked = titles[0].text if titles else "(first result)"
-        log(f"  ⚠  Exact match not found – clicking {picked!r}.")
-        cells[0].click()
-        jitter(1.2, 2.4)
+    if _open_first_exact_search_result(driver, name):
         return True
 
-    log(f"  ✗  No chat found for {name!r}.")
+    log(f"  ✗  Could not open {name!r} from search results.")
     return False
 
 
