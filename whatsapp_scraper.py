@@ -786,7 +786,96 @@ return (function(row) {
 """
 )
 
-_JS_COLLECT_REACTORS = r"""
+_JS_REACTIONS_OVERLAY_HELPERS = r"""
+function _waVisible(el) {
+    if (!el) return false;
+    try {
+        var st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) {
+            return false;
+        }
+        var r = el.getBoundingClientRect();
+        return r.width > 20 && r.height > 20;
+    } catch (e) {
+        return false;
+    }
+}
+function _waOverlayHasParticipants(root) {
+    if (!root) return false;
+    return !!root.querySelector(
+        '[data-testid="react-participant"],'
+        + '[data-testid="reactions-list-item"],'
+        + '[data-testid="reactions-list"] [role="listitem"],'
+        + '[data-testid="cell-frame-container"]'
+    );
+}
+function _waOverlayLooksLikeReactions(root) {
+    if (!root || !_waVisible(root)) return false;
+    if (_waOverlayHasParticipants(root)) return true;
+    if (root.getAttribute && root.getAttribute('data-testid') === 'reactions-list') return true;
+    return !!root.querySelector('[data-testid="reactions-tab"], [role="tablist"]');
+}
+function _waResolveReactionsRoot(dialog) {
+    if (dialog) {
+        var chain = dialog;
+        while (chain) {
+            if (_waOverlayLooksLikeReactions(chain)) return chain;
+            if (chain.getAttribute && chain.getAttribute('data-testid') === 'drawer-right') {
+                return chain;
+            }
+            chain = chain.parentElement;
+        }
+        var drawer = dialog.closest('[data-testid="drawer-right"]');
+        if (drawer && _waVisible(drawer)) return drawer;
+    }
+    var nodes = document.querySelectorAll(
+        '[data-testid="drawer-right"], [data-testid="reactions-list"], [role="dialog"]'
+    );
+    for (var i = nodes.length - 1; i >= 0; i--) {
+        if (_waOverlayLooksLikeReactions(nodes[i])) return nodes[i];
+    }
+    return dialog || null;
+}
+function _waReactionScrollTargets(root) {
+    var out = [];
+    var seen = {};
+    function add(el) {
+        if (!el || seen[el]) return;
+        seen[el] = true;
+        out.push(el);
+    }
+    add(root.querySelector('[data-testid="scrollable-content"]'));
+    add(root.querySelector('[data-scrolltraceid]'));
+    add(root.querySelector('[data-testid="reactions-list"] [role="list"]'));
+    add(root.querySelector('[data-testid="reactions-list"]'));
+    add(root.querySelector('[role="list"]'));
+    add(root);
+    return out;
+}
+"""
+
+_JS_FIND_REACTIONS_OVERLAY = (
+    _JS_REACTIONS_OVERLAY_HELPERS
+    + r"""
+return (function(dialog) {
+    return _waResolveReactionsRoot(dialog);
+})(arguments[0]);
+"""
+)
+
+_JS_HAS_REACTION_PARTICIPANTS = (
+    _JS_REACTIONS_OVERLAY_HELPERS
+    + r"""
+return (function(dialog) {
+    var root = _waResolveReactionsRoot(dialog);
+    return _waOverlayHasParticipants(root);
+})(arguments[0]);
+"""
+)
+
+_JS_COLLECT_REACTORS = (
+    _JS_REACTIONS_OVERLAY_HELPERS
+    + r"""
 return (function(dialog, targetEmoji) {
     var names = [];
     var seen = {};
@@ -835,22 +924,14 @@ return (function(dialog, targetEmoji) {
     }
     function rowEmoji(el) {
         if (!el) return '';
-        var imgs = el.querySelectorAll('img[alt]');
-        for (var i = imgs.length - 1; i >= 0; i--) {
-            var alt = (imgs[i].getAttribute('alt') || '').trim();
-            var em = firstEmoji(alt);
-            if (em) return em;
-        }
-        var img = el.querySelector('[data-testid="reaction-bubble-item"] img[alt], img[alt]');
-        if (img) {
-            var alt2 = (img.getAttribute('alt') || '').trim();
-            if (alt2) return firstEmoji(alt2) || alt2;
-        }
-        var btn = el.querySelector('[data-testid="reaction-bubble"], [aria-label]');
-        if (btn) {
-            var lbl = btn.getAttribute('aria-label') || btn.textContent || '';
-            var em2 = firstEmoji(lbl);
-            if (em2) return em2;
+        var reactionImgs = el.querySelectorAll(
+            '[data-testid="reaction-bubble-item"] img[alt],'
+            + '[data-testid="reactions-list-item"] img[alt]'
+        );
+        for (var r = reactionImgs.length - 1; r >= 0; r--) {
+            var altR = (reactionImgs[r].getAttribute('alt') || '').trim();
+            var emR = firstEmoji(altR);
+            if (emR) return emR;
         }
         return firstEmoji(el.innerText || el.textContent || '');
     }
@@ -864,7 +945,8 @@ return (function(dialog, targetEmoji) {
             + '[data-testid="react-participant"] span[title],'
             + '[data-testid="cell-frame-title"] span[title],'
             + '[data-testid="cell-frame-title"] span[dir],'
-            + '[data-testid="react-participant"]'
+            + '[data-testid="cell-frame-primary"] span[title],'
+            + '[data-testid="cell-frame-primary"] span[dir="auto"]'
         );
         if (titleEl) {
             var n = cleanName(
@@ -917,6 +999,7 @@ return (function(dialog, targetEmoji) {
         var rows = root.querySelectorAll(
             '[data-testid="react-participant"],'
             + '[data-testid="reactions-list-item"],'
+            + '[data-testid="reactions-list"] [role="listitem"],'
             + '[role="listitem"],'
             + '[data-testid="cell-frame-container"]'
         );
@@ -925,24 +1008,25 @@ return (function(dialog, targetEmoji) {
         }
     }
 
-    var root = dialog.closest('[data-testid="drawer-right"]') || dialog;
-    var scrollEl = root.querySelector('[data-testid="scrollable-content"]')
-        || root.querySelector('[data-scrolltraceid]')
-        || root.querySelector('[data-testid="reactions-list"] [role="list"]')
-        || root.querySelector('[role="list"]')
-        || root.querySelector('[data-testid="reactions-list"]')
-        || dialog;
-    collect(scrollEl);
-    var lastTop = -1;
-    for (var attempt = 0; attempt < 50; attempt++) {
-        scrollEl.scrollTop += Math.max(120, Math.floor(scrollEl.clientHeight * 0.6));
-        if (scrollEl.scrollTop === lastTop) break;
-        lastTop = scrollEl.scrollTop;
+    var root = _waResolveReactionsRoot(dialog);
+    if (!root) return names;
+
+    var scrollTargets = _waReactionScrollTargets(root);
+    for (var s = 0; s < scrollTargets.length; s++) {
+        var scrollEl = scrollTargets[s];
         collect(scrollEl);
+        var lastTop = -1;
+        for (var attempt = 0; attempt < 50; attempt++) {
+            scrollEl.scrollTop += Math.max(120, Math.floor(scrollEl.clientHeight * 0.6));
+            if (scrollEl.scrollTop === lastTop) break;
+            lastTop = scrollEl.scrollTop;
+            collect(scrollEl);
+        }
     }
     return names;
 })(arguments[0], arguments[1]);
 """
+)
 
 _JS_PARSE_REACTION_TABS = r"""
 return (function(dialog) {
@@ -996,7 +1080,9 @@ return (function(dialog) {
 })(arguments[0]);
 """
 
-_JS_COLLECT_REACTORS_GROUPED = r"""
+_JS_COLLECT_REACTORS_GROUPED = (
+    _JS_REACTIONS_OVERLAY_HELPERS
+    + r"""
 return (function(dialog) {
     var grouped = {};
     var seenRows = {};
@@ -1026,9 +1112,12 @@ return (function(dialog) {
     }
     function rowEmoji(el) {
         if (!el) return '';
-        var imgs = el.querySelectorAll('img[alt]');
-        for (var i = imgs.length - 1; i >= 0; i--) {
-            var em = firstEmoji(imgs[i].getAttribute('alt') || '');
+        var reactionImgs = el.querySelectorAll(
+            '[data-testid="reaction-bubble-item"] img[alt],'
+            + '[data-testid="reactions-list-item"] img[alt]'
+        );
+        for (var r = reactionImgs.length - 1; r >= 0; r--) {
+            var em = firstEmoji(reactionImgs[r].getAttribute('alt') || '');
             if (em) return em;
         }
         return firstEmoji(el.innerText || el.textContent || '');
@@ -1038,6 +1127,8 @@ return (function(dialog) {
         var titleEl = el.querySelector(
             '[data-testid="cell-frame-title"] span[title],'
             + '[data-testid="cell-frame-title"] span[dir],'
+            + '[data-testid="cell-frame-primary"] span[title],'
+            + '[data-testid="cell-frame-primary"] span[dir="auto"],'
             + 'span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]'
         );
         if (titleEl) {
@@ -1073,6 +1164,7 @@ return (function(dialog) {
         var rows = root.querySelectorAll(
             '[data-testid="react-participant"],'
             + '[data-testid="reactions-list-item"],'
+            + '[data-testid="reactions-list"] [role="listitem"],'
             + '[role="listitem"],'
             + '[data-testid="cell-frame-container"]'
         );
@@ -1087,20 +1179,20 @@ return (function(dialog) {
         }
     }
 
-    var root = dialog.closest('[data-testid="drawer-right"]') || dialog;
-    var scrollEl = root.querySelector('[data-testid="scrollable-content"]')
-        || root.querySelector('[data-scrolltraceid]')
-        || root.querySelector('[data-testid="reactions-list"] [role="list"]')
-        || root.querySelector('[role="list"]')
-        || root.querySelector('[data-testid="reactions-list"]')
-        || dialog;
-    collect(scrollEl);
-    var lastTop = -1;
-    for (var attempt = 0; attempt < 50; attempt++) {
-        scrollEl.scrollTop += Math.max(120, Math.floor(scrollEl.clientHeight * 0.6));
-        if (scrollEl.scrollTop === lastTop) break;
-        lastTop = scrollEl.scrollTop;
+    var root = _waResolveReactionsRoot(dialog);
+    if (!root) return [];
+
+    var scrollTargets = _waReactionScrollTargets(root);
+    for (var s = 0; s < scrollTargets.length; s++) {
+        var scrollEl = scrollTargets[s];
         collect(scrollEl);
+        var lastTop = -1;
+        for (var attempt = 0; attempt < 50; attempt++) {
+            scrollEl.scrollTop += Math.max(120, Math.floor(scrollEl.clientHeight * 0.6));
+            if (scrollEl.scrollTop === lastTop) break;
+            lastTop = scrollEl.scrollTop;
+            collect(scrollEl);
+        }
     }
 
     var out = [];
@@ -1113,6 +1205,7 @@ return (function(dialog) {
     return out;
 })(arguments[0]);
 """
+)
 
 _JS_SCROLL_HELPERS = r"""
 function _waFindScrollEl(panel) {
@@ -1485,11 +1578,31 @@ def _emoji_matches(left: str, right: str) -> bool:
     return left_n in right_n or right_n in left_n
 
 
+def _click_element(driver, el) -> None:
+    """Click an element with human-like pointer interaction."""
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center', inline:'nearest'});",
+        el,
+    )
+    jitter(0.15, 0.35)
+    try:
+        ActionChains(driver).move_to_element(el).click().perform()
+    except (ElementNotInteractableException, StaleElementReferenceException):
+        driver.execute_script("arguments[0].click();", el)
+
+
 def _wait_for_reaction_dialog(driver, timeout: float = 8.0):
     """Wait until WhatsApp's reactions drawer is visible."""
     deadline = time.time() + timeout
     last_err: Optional[Exception] = None
     while time.time() < deadline:
+        try:
+            overlay = driver.execute_script(_JS_FIND_REACTIONS_OVERLAY, None)
+            if overlay:
+                return overlay
+        except StaleElementReferenceException as exc:
+            last_err = exc
+
         for drawer in driver.find_elements(By.CSS_SELECTOR, '[data-testid="drawer-right"]'):
             try:
                 if not drawer.is_displayed():
@@ -1508,6 +1621,16 @@ def _wait_for_reaction_dialog(driver, timeout: float = 8.0):
                 last_err = exc
         time.sleep(0.15)
     raise TimeoutException("Reaction dialog did not appear") from last_err
+
+
+def _wait_for_reaction_participants(driver, dialog, timeout: float = 4.0) -> None:
+    """Wait until at least one reactor row appears in the open overlay."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script(_JS_HAS_REACTION_PARTICIPANTS, dialog)
+        )
+    except TimeoutException:
+        pass
 
 
 def _message_id(row_el) -> str:
@@ -2276,18 +2399,16 @@ def _collect_reaction_senders(
 
     senders: List[str] = []
     seen: set = set()
-    root = dialog
     try:
-        drawer = dialog.find_element(
-            By.XPATH,
-            "./ancestor::*[@data-testid='drawer-right'][1]",
-        )
-        root = drawer
-    except (NoSuchElementException, StaleElementReferenceException):
-        pass
+        root = driver.execute_script(_JS_FIND_REACTIONS_OVERLAY, dialog)
+    except Exception:
+        root = dialog
+    if not root:
+        root = dialog
 
     scroll_el = (
         find(root, S["rxn_scroll"])
+        or find(root, '[data-testid="reactions-list"]')
         or find(root, '[role="list"]')
         or find(root, S["rxn_dialog"])
         or root
@@ -2463,14 +2584,43 @@ def _click_reaction_tab(driver, dialog, emoji: str) -> None:
                 or ""
             ).strip()
             if _emoji_matches(emoji, tab_text):
-                driver.execute_script("arguments[0].click();", tab)
+                _click_element(driver, tab)
                 jitter(0.25, 0.45)
                 return
         except StaleElementReferenceException:
             continue
 
 
-def _parse_reactions_from_dialog(driver, dialog) -> List[Reaction]:
+def _collect_senders_for_emoji(
+    driver,
+    row_el,
+    emoji: str,
+) -> List[str]:
+    """Open the reactions overlay for one emoji and return reactor names."""
+    target = _find_reaction_pill(row_el, emoji) or _find_reaction_click_target(row_el, emoji)
+    if not target:
+        return []
+
+    try:
+        _click_element(driver, target)
+        jitter(0.35, 0.75)
+        dialog = _wait_for_reaction_dialog(driver)
+        _click_reaction_tab(driver, dialog, emoji)
+        _wait_for_reaction_participants(driver, dialog)
+        jitter(0.2, 0.4)
+        senders = _collect_reaction_senders(driver, dialog, "")
+        if not senders:
+            senders = _collect_reaction_senders(driver, dialog, emoji)
+        return senders
+    except (TimeoutException, StaleElementReferenceException,
+            ElementNotInteractableException):
+        return []
+    finally:
+        _dismiss_reaction_dialog(driver)
+        jitter(0.15, 0.3)
+
+
+def _parse_reactions_from_dialog(driver, dialog, basic: List[Reaction]) -> List[Reaction]:
     """Read emoji tabs + senders from an already-open reactions drawer."""
     try:
         tabs_raw = driver.execute_script(_JS_PARSE_REACTION_TABS, dialog) or []
@@ -2485,10 +2635,11 @@ def _parse_reactions_from_dialog(driver, dialog) -> List[Reaction]:
                 continue
             count = int(tab_info.get("count", 1))
             _click_reaction_tab(driver, dialog, emoji)
+            _wait_for_reaction_participants(driver, dialog)
             jitter(0.2, 0.4)
-            senders = _collect_reaction_senders(driver, dialog, emoji)
+            senders = _collect_reaction_senders(driver, dialog, "")
             if not senders:
-                senders = _collect_reaction_senders(driver, dialog, "")
+                senders = _collect_reaction_senders(driver, dialog, emoji)
             detailed.append(Reaction(emoji=emoji, count=count, senders=senders))
         return detailed
 
@@ -2508,50 +2659,68 @@ def _parse_reactions_from_dialog(driver, dialog) -> List[Reaction]:
         pass
 
     senders = _collect_reaction_senders(driver, dialog, "")
-    if senders:
-        return [Reaction(emoji="", count=len(senders), senders=senders)]
+    if senders and len(basic) == 1:
+        only = basic[0]
+        return [Reaction(emoji=only.emoji, count=only.count, senders=senders)]
     return []
+
+
+def _merge_reaction_senders(
+    basic: List[Reaction],
+    detailed: List[Reaction],
+) -> List[Reaction]:
+    """Prefer detailed senders but keep inline counts when senders are missing."""
+    by_emoji: Dict[str, Reaction] = {}
+    for rxn in detailed:
+        key = _normalize_emoji(rxn.emoji)
+        if key and key not in by_emoji:
+            by_emoji[key] = rxn
+
+    merged: List[Reaction] = []
+    for rxn in basic:
+        key = _normalize_emoji(rxn.emoji)
+        detail = by_emoji.get(key)
+        senders = detail.senders if detail and detail.senders else []
+        count = rxn.count if rxn.count else (detail.count if detail else 1)
+        merged.append(Reaction(emoji=rxn.emoji, count=count, senders=senders))
+    return merged
 
 
 def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
     """
-    Open the reactions drawer once, read per-emoji tabs for counts, then
-    collect senders from each tab.
+    Open the reactions drawer for each emoji pill, read tabs, and collect
+    participant names.
     """
+    basic = _parse_reactions_basic(driver, row_el)
+    if not basic:
+        return []
+
+    detailed: List[Reaction] = []
+    for rxn in basic:
+        senders = _collect_senders_for_emoji(driver, row_el, rxn.emoji)
+        detailed.append(Reaction(emoji=rxn.emoji, count=rxn.count, senders=senders))
+
+    if any(r.senders for r in detailed):
+        return detailed
+
     target = _find_reaction_click_target(row_el, "")
     if not target:
-        return _parse_reactions_basic(driver, row_el)
+        return basic
 
     try:
-        driver.execute_script("arguments[0].click();", target)
+        _click_element(driver, target)
         jitter(0.45, 0.9)
-
         dialog = _wait_for_reaction_dialog(driver)
-        detailed = _parse_reactions_from_dialog(driver, dialog)
+        _wait_for_reaction_participants(driver, dialog)
+        batch = _parse_reactions_from_dialog(driver, dialog, basic)
         _dismiss_reaction_dialog(driver)
-
-        if detailed:
-            # Drop placeholder rows with no emoji (All-tab fallback).
-            cleaned = [r for r in detailed if r.emoji]
-            if cleaned:
-                return cleaned
-            only = detailed[0]
-            basic = _parse_reactions_basic(driver, row_el)
-            if basic and only.senders:
-                return [
-                    Reaction(
-                        emoji=rxn.emoji,
-                        count=rxn.count,
-                        senders=only.senders if len(basic) == 1 else [],
-                    )
-                    for rxn in basic
-                ]
-
+        if batch and any(r.senders for r in batch):
+            return _merge_reaction_senders(basic, batch)
     except (TimeoutException, StaleElementReferenceException,
             ElementNotInteractableException):
         _dismiss_reaction_dialog(driver)
 
-    return _parse_reactions_basic(driver, row_el)
+    return basic
 
 
 def _parse_message(
