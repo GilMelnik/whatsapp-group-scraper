@@ -1340,11 +1340,33 @@ def _find_reaction_pill(row_el, emoji: str):
     return None
 
 
+def _dismiss_reaction_dialog(driver) -> None:
+    """Close an open reactions popup without disturbing chat scroll."""
+    try:
+        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+        jitter(0.15, 0.3)
+    except Exception:
+        pass
+
+
+def _has_reaction_pills(row_el) -> bool:
+    """Return True when the row currently shows at least one reaction pill."""
+    scope = _reaction_scope(row_el)
+    if find(scope, S["rxn_pill"]) or find(scope, '[data-testid="reaction-bubble"]'):
+        return True
+    for container in find_all(scope, S["rxn_container"]):
+        if find(container, '[role="button"], button'):
+            return True
+    return False
+
+
 def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
     """
     Click each reaction pill to open the 'who reacted' dialog, scroll the
     participant list, then harvest names.  Much slower – use only with
     --reactions-detail.
+
+    Uses JS click (no scrollIntoView) so the message panel position is kept.
     """
     basic    = _parse_reactions_basic(driver, row_el)
     detailed = []
@@ -1355,14 +1377,8 @@ def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
 
         if target_pill:
             try:
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center'});", target_pill
-                )
-                jitter(0.2, 0.4)
-                ActionChains(driver).move_to_element(target_pill).perform()
-                jitter(0.2, 0.4)
-                target_pill.click()
-                jitter(0.5, 0.9)
+                driver.execute_script("arguments[0].click();", target_pill)
+                jitter(0.4, 0.8)
 
                 dialog = WebDriverWait(driver, 6).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, S["rxn_dialog"]))
@@ -1371,27 +1387,117 @@ def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
                 tabs = find_all(dialog, S["rxn_tab"])
                 for tab in tabs:
                     if rxn.emoji in tab.text:
-                        tab.click()
-                        jitter(0.25, 0.5)
+                        driver.execute_script("arguments[0].click();", tab)
+                        jitter(0.2, 0.4)
                         break
 
                 senders = _collect_reaction_senders(driver, dialog)
-
-                ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-                jitter(0.3, 0.6)
+                _dismiss_reaction_dialog(driver)
 
             except (TimeoutException, StaleElementReferenceException,
                     ElementNotInteractableException):
-                ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-                jitter(0.2, 0.4)
+                _dismiss_reaction_dialog(driver)
 
         detailed.append(Reaction(emoji=rxn.emoji, count=rxn.count, senders=senders))
 
     return detailed
 
 
-def _parse_message(driver, row_el, current_date: str,
-                   reactions_detail: bool = False) -> Optional[Message]:
+def _enrich_reactions_detail(
+    driver,
+    panel,
+    messages: Dict[str, Message],
+    scroll_pause: float = 1.0,
+    max_passes: int = 4000,
+) -> None:
+    """
+    Second pass: scroll the chat and click reaction pills for messages that
+    already have basic emoji/count data.  Kept separate from the main harvest
+    loop so reaction popups never hijack the scroll position.
+    """
+    pending = {
+        mid for mid, msg in messages.items()
+        if msg.reactions and not any(r.senders for r in msg.reactions)
+    }
+    if not pending:
+        return
+
+    log(f"☺  Collecting who reacted ({len(pending)} messages) …")
+    driver.execute_script("arguments[0].scrollTop = 0;", panel)
+    jitter(1.0, 1.8)
+    wait_no_spinner(driver, panel)
+
+    enriched: set = set()
+    no_progress = 0
+    max_scroll_top = 0
+
+    for pass_n in range(1, max_passes + 1):
+        wait_no_spinner(driver, panel)
+        progress = 0
+
+        try:
+            rows = panel.find_elements(By.CSS_SELECTOR, S["message_row"])
+        except StaleElementReferenceException:
+            panel = driver.find_element(By.CSS_SELECTOR, S["panel"])
+            rows = panel.find_elements(By.CSS_SELECTOR, S["message_row"])
+
+        for row in rows:
+            try:
+                mid = _message_id(row)
+                if not mid or mid not in pending or mid in enriched:
+                    continue
+                if not _has_reaction_pills(row):
+                    continue
+
+                scope = _reaction_scope(row)
+                detailed = _parse_reactions_detail(driver, scope)
+                messages[mid].reactions = detailed
+                enriched.add(mid)
+                progress += 1
+            except StaleElementReferenceException:
+                continue
+
+        if progress:
+            no_progress = 0
+            if pass_n == 1 or pass_n % 10 == 0:
+                log(f"  ☺ pass {pass_n}: {len(enriched)}/{len(pending)} detailed")
+        else:
+            no_progress += 1
+
+        scroll_top = driver.execute_script("return arguments[0].scrollTop;", panel)
+        scroll_height = driver.execute_script("return arguments[0].scrollHeight;", panel)
+        client_height = driver.execute_script("return arguments[0].clientHeight;", panel)
+        max_scroll_top = max(max_scroll_top, scroll_top)
+        at_bottom = (scroll_top + client_height) >= (scroll_height - 20)
+
+        if len(enriched) >= len(pending):
+            log(f"  ☺ reaction details complete ({len(enriched)} messages)")
+            break
+
+        if at_bottom and no_progress >= 8:
+            log(
+                f"  ☺ reaction pass finished at bottom "
+                f"({len(enriched)}/{len(pending)} detailed)"
+            )
+            break
+
+        if no_progress >= 20 and scroll_top >= max_scroll_top - 40:
+            log(
+                f"  ☺ reaction pass stalled "
+                f"({len(enriched)}/{len(pending)} detailed)"
+            )
+            break
+
+        scroll_by(driver, panel, random.randint(180, 320))
+        jitter(scroll_pause * 0.4, scroll_pause * 0.9)
+    else:
+        log(
+            f"  ⚠ reaction detail pass limit reached "
+            f"({len(enriched)}/{len(pending)} detailed)"
+        )
+
+
+def _parse_message(driver, row_el, current_date: str) -> Optional[Message]:
     """
     Parse a single message row into a Message dataclass.
     Each field is read from its own DOM zone — never from combined row text.
@@ -1443,11 +1549,7 @@ def _parse_message(driver, row_el, current_date: str,
         if not sender and not text and media_type is None:
             return None
 
-        reactions = (
-            _parse_reactions_detail(driver, _reaction_scope(row_el))
-            if reactions_detail
-            else _parse_reactions_basic(driver, _reaction_scope(row_el))
-        )
+        reactions = _parse_reactions_basic(driver, _reaction_scope(row_el))
 
         return Message(
             id          = mid,
@@ -1526,12 +1628,13 @@ def scrape_chat(
     jitter(1.2, 2.2)
 
     # ── scroll down + collect ─────────────────────────────────────────────────
-    messages:      Dict[str, Message] = {}
-    current_date:  str = datetime.today().strftime("%d/%m/%Y")
-    no_new_streak  = 0
-    pass_n         = 0
+    messages:       Dict[str, Message] = {}
+    current_date:   str = datetime.today().strftime("%d/%m/%Y")
+    no_new_streak   = 0
+    pass_n          = 0
     last_scroll_top = -1
     same_scroll_streak = 0
+    max_scroll_top  = 0
 
     while pass_n < max_down_passes:
         pass_n += 1
@@ -1561,7 +1664,7 @@ def scrape_chat(
                 if testid != "msg-container":
                     continue
 
-                msg = _parse_message(driver, item, current_date, reactions_detail)
+                msg = _parse_message(driver, item, current_date)
                 if msg and msg.id not in messages:
                     messages[msg.id] = msg
 
@@ -1574,7 +1677,8 @@ def scrape_chat(
         scroll_top    = driver.execute_script("return arguments[0].scrollTop;", panel)
         scroll_height = driver.execute_script("return arguments[0].scrollHeight;", panel)
         client_height = driver.execute_script("return arguments[0].clientHeight;", panel)
-        at_bottom     = (scroll_top + client_height) >= (scroll_height - 20)
+        max_scroll_top = max(max_scroll_top, scroll_top)
+        at_bottom      = (scroll_top + client_height) >= (scroll_height - 20)
 
         if scroll_top == last_scroll_top:
             same_scroll_streak += 1
@@ -1598,7 +1702,18 @@ def scrape_chat(
             )
             break
 
-        scroll_by(driver, panel, random.randint(380, 720))
+        if (
+            no_new_streak >= 10
+            and scroll_top >= max_scroll_top - 60
+            and pass_n > 5
+        ):
+            log(
+                f"\n✓  No new messages near bottom.  "
+                f"{len(messages)} messages captured."
+            )
+            break
+
+        scroll_by(driver, panel, random.randint(220, 420))
         jitter(scroll_pause * 0.6, scroll_pause * 1.4)
 
     else:
@@ -1606,6 +1721,9 @@ def scrape_chat(
             f"\n⚠  Stopped after {max_down_passes} down-scroll passes.  "
             f"{len(messages)} messages captured."
         )
+
+    if reactions_detail:
+        _enrich_reactions_detail(driver, panel, messages, scroll_pause)
 
     return list(messages.values())
 
