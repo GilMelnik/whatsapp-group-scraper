@@ -22,7 +22,7 @@ class ScraperConfig:
     profile_dir: Optional[str] = None
     scroll_pause: float = 1.0
     max_top_scrolls: int = 6000
-    max_down_passes: int = 2500
+    max_down_passes: int = 3
     reactions_detail: bool = True
 
 

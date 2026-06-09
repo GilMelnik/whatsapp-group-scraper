@@ -114,8 +114,8 @@ def main() -> None:
     ap.add_argument(
         "--max-down-passes",
         type=int,
-        default=2500,
-        help="Max downward scroll passes when reading messages (default: 2500).",
+        default=3,
+        help="Max downward scroll passes when reading messages (default: 3).",
     )
     ap.add_argument(
         "--no-reactions-detail",
