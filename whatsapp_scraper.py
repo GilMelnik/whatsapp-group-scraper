@@ -869,14 +869,128 @@ return (function(dialog, targetEmoji) {
 })(arguments[0], arguments[1]);
 """
 
-_JS_PANEL_METRICS = r"""
+_JS_SCROLL_HELPERS = r"""
+function _waFindScrollEl(panel) {
+    function score(el) {
+        if (!el || el.scrollHeight <= el.clientHeight + 2) return -1;
+        var oy = window.getComputedStyle(el).overflowY;
+        if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return -1;
+        var rows = el.querySelectorAll(
+            'div.focusable-list-item[data-id], [data-testid="msg-container"]'
+        ).length;
+        return rows * 10000 + el.scrollHeight;
+    }
+    var best = panel;
+    var bestScore = score(panel);
+    var pref = panel.querySelector('[tabindex="-1"]');
+    if (pref) {
+        var ps = score(pref);
+        if (ps > bestScore) { bestScore = ps; best = pref; }
+    }
+    var nodes = panel.querySelectorAll(
+        '[role="application"], [data-scrolltraceid], div'
+    );
+    for (var i = 0; i < nodes.length; i++) {
+        var s = score(nodes[i]);
+        if (s > bestScore) { bestScore = s; best = nodes[i]; }
+    }
+    var p = panel.parentElement;
+    while (p && p !== document.body) {
+        var s = score(p);
+        if (s > bestScore) { bestScore = s; best = p; }
+        p = p.parentElement;
+    }
+    return best;
+}
+function _waTopmostRow(panel) {
+    var rows = panel.querySelectorAll('div.focusable-list-item[data-id]');
+    var topRow = null;
+    var minY = Infinity;
+    for (var i = 0; i < rows.length; i++) {
+        var rect = rows[i].getBoundingClientRect();
+        if (rect.top < minY) {
+            minY = rect.top;
+            topRow = rows[i];
+        }
+    }
+    return topRow;
+}
+function _waDispatchWheel(scrollEl, deltaY) {
+    try {
+        scrollEl.dispatchEvent(new WheelEvent('wheel', {
+            deltaY: deltaY,
+            deltaMode: 0,
+            bubbles: true,
+            cancelable: true,
+            view: window
+        }));
+    } catch (e) {}
+}
+function _waIsReversed(el) {
+    function hasReverse(node) {
+        try {
+            var fd = window.getComputedStyle(node).flexDirection || '';
+            if (fd.indexOf('reverse') >= 0) return true;
+        } catch (e) {}
+        return false;
+    }
+    if (hasReverse(el)) return true;
+    var kids = el.querySelectorAll(
+        '[role="row"], [data-testid="msg-container"], div.focusable-list-item'
+    );
+    for (var i = 0; i < kids.length && i < 16; i++) {
+        if (hasReverse(kids[i])) return true;
+    }
+    // Fresh chats open at the newest messages with raw scrollTop ~= 0.
+    if (el.scrollTop >= -2 && el.scrollTop <= 2) {
+        var rows = el.querySelectorAll('div.focusable-list-item[data-id]');
+        if (rows.length > 0) {
+            var last = rows[rows.length - 1];
+            var rect = last.getBoundingClientRect();
+            var er = el.getBoundingClientRect();
+            if (rect.bottom >= er.bottom - 40) return true;
+        }
+    }
+    return false;
+}
+function _waLogicalTop(el, reversed) {
+    if (reversed) {
+        return el.scrollTop + el.scrollHeight - el.clientHeight;
+    }
+    return el.scrollTop;
+}
+function _waSetLogicalTop(el, reversed, logical) {
+    if (reversed) {
+        el.scrollTop = logical - el.scrollHeight + el.clientHeight;
+    } else {
+        el.scrollTop = logical;
+    }
+}
+function _waMaxLogical(el) {
+    return Math.max(0, el.scrollHeight - el.clientHeight);
+}
+function _waAtTop(el, reversed) {
+    return _waLogicalTop(el, reversed) <= 2;
+}
+function _waAtBottom(el, reversed) {
+    return _waLogicalTop(el, reversed) >= _waMaxLogical(el) - 8;
+}
+"""
+
+_JS_PANEL_METRICS = (
+    _JS_SCROLL_HELPERS
+    + r"""
 return (function(panel) {
+    var scrollEl = _waFindScrollEl(panel);
+    var reversed = _waIsReversed(scrollEl);
     var panelRect = panel.getBoundingClientRect();
     var rows = panel.querySelectorAll('div.focusable-list-item[data-id], [data-testid="msg-container"]');
     var visible = [];
     var maxBottom = -Infinity;
     var minTop = Infinity;
     var anchorBottom = null;
+    var oldestId = '';
+    var oldestTop = Infinity;
 
     for (var i = 0; i < rows.length; i++) {
         var el = rows[i];
@@ -902,29 +1016,43 @@ return (function(panel) {
             anchorBottom = relBottom;
         }
         if (relTop < minTop) minTop = relTop;
+        if (dataId && relTop < oldestTop) {
+            oldestTop = relTop;
+            oldestId = dataId;
+        }
     }
 
+    var logicalTop = _waLogicalTop(scrollEl, reversed);
     return {
-        scrollTop: panel.scrollTop,
-        scrollHeight: panel.scrollHeight,
-        clientHeight: panel.clientHeight,
+        scrollTop: logicalTop,
+        rawScrollTop: scrollEl.scrollTop,
+        scrollHeight: scrollEl.scrollHeight,
+        clientHeight: scrollEl.clientHeight,
         visibleCount: visible.length,
         anchorBottom: anchorBottom,
         anchorTop: minTop === Infinity ? null : minTop,
-        atBottom: panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 8,
-        atTop: panel.scrollTop <= 1,
+        oldestId: oldestId,
+        reversed: reversed,
+        atBottom: _waAtBottom(scrollEl, reversed),
+        atTop: _waAtTop(scrollEl, reversed),
         visible: visible
     };
 })(arguments[0]);
 """
+)
 
-_JS_PANEL_SCROLL = r"""
+_JS_PANEL_SCROLL = (
+    _JS_SCROLL_HELPERS
+    + r"""
 return (function(panel, direction, overlap) {
     overlap = overlap || 28;
     direction = direction || 'down';
+    var scrollEl = _waFindScrollEl(panel);
+    var reversed = _waIsReversed(scrollEl);
     var panelRect = panel.getBoundingClientRect();
     var rows = panel.querySelectorAll('div.focusable-list-item[data-id], [data-testid="msg-container"]');
-    var prevTop = panel.scrollTop;
+    var prevLogical = _waLogicalTop(scrollEl, reversed);
+    var prevRaw = scrollEl.scrollTop;
     var delta = 0;
 
     if (direction === 'down') {
@@ -940,39 +1068,46 @@ return (function(panel, direction, overlap) {
         if (maxBottom > -Infinity) {
             delta = Math.max(12, maxBottom - overlap);
         } else {
-            delta = Math.max(48, Math.floor(panel.clientHeight * 0.45));
+            delta = Math.max(48, Math.floor(scrollEl.clientHeight * 0.45));
         }
-        panel.scrollTop += delta;
+        _waSetLogicalTop(scrollEl, reversed, prevLogical + delta);
     } else {
-        var minTop = Infinity;
-        for (var j = 0; j < rows.length; j++) {
-            el = rows[j];
-            rect = el.getBoundingClientRect();
-            if (rect.bottom <= panelRect.top + 1) continue;
-            if (rect.top >= panelRect.bottom - 1) continue;
-            var relTop = rect.top - panelRect.top;
-            if (relTop < minTop) minTop = relTop;
+        delta = Math.max(350, Math.floor(scrollEl.clientHeight * 0.8));
+        var topRow = _waTopmostRow(panel);
+        if (topRow) {
+            var sRect = scrollEl.getBoundingClientRect();
+            var tRect = topRow.getBoundingClientRect();
+            var offset = Math.max(0, tRect.top - sRect.top - 12);
+            delta = Math.max(delta, offset + 180);
         }
-        if (minTop < Infinity) {
-            delta = Math.max(12, minTop + overlap);
-        } else {
-            delta = Math.max(48, Math.floor(panel.clientHeight * 0.45));
+        if (topRow) {
+            try {
+                topRow.scrollIntoView({block: 'start', inline: 'nearest'});
+            } catch (e) {}
         }
-        panel.scrollTop -= delta;
-        if (panel.scrollTop < 0) panel.scrollTop = 0;
+        var targets = [scrollEl];
+        if (panel !== scrollEl) targets.push(panel);
+        for (var ti = 0; ti < targets.length; ti++) {
+            targets[ti].scrollTop -= delta;
+            _waDispatchWheel(targets[ti], -delta);
+        }
     }
 
-    var scrolled = panel.scrollTop - prevTop;
+    var logicalTop = _waLogicalTop(scrollEl, reversed);
     return {
-        scrolled: scrolled,
+        scrolled: logicalTop - prevLogical,
         delta: delta,
-        scrollTop: panel.scrollTop,
-        atBottom: panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 8,
-        atTop: panel.scrollTop <= 1,
-        stuck: Math.abs(scrolled) < 1
+        scrollTop: logicalTop,
+        rawScrollTop: scrollEl.scrollTop,
+        reversed: reversed,
+        atBottom: _waAtBottom(scrollEl, reversed),
+        atTop: _waAtTop(scrollEl, reversed),
+        stuck: Math.abs(logicalTop - prevLogical) < 1
+            && Math.abs(scrollEl.scrollTop - prevRaw) < 1
     };
 })(arguments[0], arguments[1], arguments[2]);
 """
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Utility helpers
@@ -2244,44 +2379,148 @@ def _harvest_visible_messages(
     return added, current_date
 
 
+def _panel_scroll_chunk(driver, panel, px: int) -> None:
+    """Scroll panel + inner container in human-like chunks (negative px = up)."""
+    try:
+        driver.execute_script(
+            _JS_SCROLL_HELPERS
+            + r"""
+            var panel = arguments[0];
+            var px = arguments[1];
+            var scrollEl = _waFindScrollEl(panel);
+            var targets = [scrollEl];
+            if (panel !== scrollEl) targets.push(panel);
+            var sign = px < 0 ? -1 : 1;
+            var remaining = Math.abs(px);
+            while (remaining > 0) {
+                var chunk = Math.min(remaining, 90 + Math.floor(Math.random() * 80));
+                for (var i = 0; i < targets.length; i++) {
+                    targets[i].scrollTop += sign * chunk;
+                    _waDispatchWheel(targets[i], sign * chunk);
+                }
+                remaining -= chunk;
+            }
+            """,
+            panel,
+            px,
+        )
+    except Exception:
+        scroll_by(driver, panel, px)
+
+
+def _panel_scroll_fallback(driver, panel, direction: str) -> None:
+    """Wheel / Page-Up fallback when programmatic scroll reports stuck."""
+    try:
+        scroll_el = driver.execute_script(
+            _JS_SCROLL_HELPERS
+            + "return _waFindScrollEl(arguments[0]);",
+            panel,
+        )
+        if scroll_el:
+            try:
+                driver.execute_script(
+                    "arguments[0].focus(); arguments[0].click();", scroll_el
+                )
+            except Exception:
+                pass
+            delta = -500 if direction == "up" else 500
+            driver.execute_script(
+                _JS_SCROLL_HELPERS
+                + "var el=arguments[0], px=arguments[1];"
+                + "el.scrollTop += px; _waDispatchWheel(el, px);",
+                scroll_el,
+                delta,
+            )
+    except Exception:
+        pass
+    try:
+        panel.click()
+    except (ElementNotInteractableException, StaleElementReferenceException):
+        pass
+    try:
+        key = Keys.PAGE_UP if direction == "up" else Keys.PAGE_DOWN
+        for _ in range(2 if direction == "up" else 1):
+            ActionChains(driver).send_keys(key).perform()
+            time.sleep(0.05)
+    except Exception:
+        pass
+
+
+def _rewind_near_top(metrics: dict) -> bool:
+    """Return True when the panel is near the oldest loaded messages."""
+    logical = metrics.get("scrollTop", 0)
+    max_logical = max(
+        0,
+        metrics.get("scrollHeight", 0) - metrics.get("clientHeight", 0),
+    )
+    if max_logical <= 0:
+        return True
+    return logical <= max(max_logical * 0.05, 24)
+
+
 def _scroll_to_top(
     driver,
     panel,
     scroll_pause: float,
     max_steps: int,
-) -> None:
-    """Single upward scroll until the oldest loaded history is reached."""
+) -> dict:
+    """Scroll upward until the oldest loaded history is reached."""
     stall_n = 0
+    prev_oldest_id = ""
+    prev_logical = -1
+    log_every = 1 if max_steps <= 25 else 20
 
     for step in range(1, max_steps + 1):
         wait_no_spinner(driver, panel)
         metrics = _panel_metrics(driver, panel)
         top = metrics.get("scrollTop", 0)
+        oldest_id = metrics.get("oldestId") or ""
 
-        if step == 1 or step % 20 == 0:
+        if step == 1 or step % log_every == 0:
             visible = metrics.get("visibleCount", 0)
-            log(f"  ↑ scrollTop={top}, visible={visible}")
+            reversed_flag = metrics.get("reversed", False)
+            raw_top = metrics.get("rawScrollTop", 0)
+            log(
+                f"  ↑ step {step}: logicalTop={top}, raw={raw_top},"
+                f" visible={visible}"
+                f"{', reversed' if reversed_flag else ''}"
+            )
 
-        if metrics.get("atTop") or top == 0:
+        if _rewind_near_top(metrics):
             jitter(0.8, 1.5)
             wait_no_spinner(driver, panel)
             metrics = _panel_metrics(driver, panel)
-            if metrics.get("atTop") or metrics.get("scrollTop", 0) == 0:
+            if _rewind_near_top(metrics):
                 log(f"  ↑ reached top ({step} steps)")
-                return
+                return metrics
 
         result = _panel_scroll(driver, panel, "up")
         if result.get("stuck"):
             stall_n += 1
-            jitter(1.5, 2.5)
+            _panel_scroll_chunk(driver, panel, -random.randint(450, 750))
+            _panel_scroll_fallback(driver, panel, "up")
+            jitter(0.6, 1.2)
             wait_no_spinner(driver, panel)
-            if stall_n >= 3:
-                log(f"  ↑ top of loaded history (scrollTop={top})")
-                return
+            metrics = _panel_metrics(driver, panel)
+            oldest_id = metrics.get("oldestId") or oldest_id
+            top = metrics.get("scrollTop", top)
+            if stall_n >= 5 and oldest_id == prev_oldest_id and top == prev_logical:
+                log(
+                    f"  ↑ top of loaded history"
+                    f" (logicalTop={top})"
+                )
+                return metrics
         else:
             stall_n = 0
 
-        jitter(scroll_pause * 0.25, scroll_pause * 0.6)
+        if oldest_id and oldest_id != prev_oldest_id:
+            prev_oldest_id = oldest_id
+            stall_n = 0
+
+        prev_logical = top
+        jitter(scroll_pause * 0.15, scroll_pause * 0.35)
+
+    return _panel_metrics(driver, panel)
 
 
 def scrape_chat(
@@ -2305,7 +2544,13 @@ def scrape_chat(
 
     # ── single upward scroll ──────────────────────────────────────────────────
     log("↑  Rewinding to the start of history …")
-    _scroll_to_top(driver, panel, scroll_pause, max_top_scrolls)
+    rewind_metrics = _scroll_to_top(driver, panel, scroll_pause, max_top_scrolls)
+    rewind_ok = _rewind_near_top(rewind_metrics)
+    if not rewind_ok:
+        log(
+            "  ⚠  Rewind did not reach the top — will keep scrolling up"
+            " while harvesting."
+        )
 
     if reactions_detail:
         log("↓  Reading messages and collecting reactors …")
@@ -2361,16 +2606,42 @@ def scrape_chat(
                 f" (+{added} new), visible={visible_n}, scrollTop={scroll_top}"
             )
 
-        if at_bottom and no_new_streak >= 5:
+        if (
+            at_bottom
+            and no_new_streak >= 5
+            and rewind_ok
+        ):
             _harvest_visible_messages(
                 driver, panel, messages, current_date, reactions_detail,
             )
             log(f"\n✓  End of chat reached.  {len(messages)} messages captured.")
             break
 
+        if not rewind_ok:
+            up_metrics = metrics
+            for _ in range(8):
+                wait_no_spinner(driver, panel)
+                up_result = _panel_scroll(driver, panel, "up")
+                if up_result.get("stuck"):
+                    _panel_scroll_fallback(driver, panel, "up")
+                up_metrics = _panel_metrics(driver, panel)
+                if _rewind_near_top(up_metrics):
+                    rewind_ok = True
+                    break
+                jitter(scroll_pause * 0.1, scroll_pause * 0.2)
+            if step_n == 1 or step_n % 10 == 0 or rewind_ok:
+                log(
+                    "  ↑  loading history"
+                    f" (logicalTop={up_metrics.get('scrollTop', 0)}) …"
+                )
+            no_new_streak = 0
+            stall_streak = 0
+            continue
+
         scroll_result = _panel_scroll(driver, panel, "down")
         if scroll_result.get("stuck"):
             stall_streak += 1
+            _panel_scroll_fallback(driver, panel, "down")
         else:
             stall_streak = 0
 
