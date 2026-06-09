@@ -691,9 +691,37 @@ return (function(row) {
         return m ? m[0] : '';
     }
 
+    function allEmojis(s) {
+        var out = [];
+        var re = /\p{Extended_Pictographic}/gu;
+        var m;
+        while ((m = re.exec(s || '')) !== null) {
+            if (out.indexOf(m[0]) === -1) out.push(m[0]);
+        }
+        return out;
+    }
+
     function parseCount(s) {
         var m = (s || '').match(/\d+/);
         return m ? parseInt(m[0], 10) : 1;
+    }
+
+    function emojisFromBubble(btn) {
+        var emojis = [];
+        var items = btn.querySelectorAll(
+            '[data-testid="reaction-bubble-item"] img[alt], img[alt]'
+        );
+        for (var i = 0; i < items.length; i++) {
+            var alt = (items[i].getAttribute('alt') || '').trim();
+            var em = firstEmoji(alt) || alt;
+            if (em && emojis.indexOf(em) === -1) emojis.push(em);
+        }
+        if (emojis.length === 0) {
+            var lbl = btn.getAttribute('aria-label') || '';
+            var txt = (btn.innerText || btn.textContent || '').trim();
+            emojis = allEmojis(lbl + ' ' + txt);
+        }
+        return emojis;
     }
 
     function scanReactionBubbles(root) {
@@ -701,15 +729,16 @@ return (function(row) {
         var bubbles = root.querySelectorAll('[data-testid="reaction-bubble"]');
         for (var b = 0; b < bubbles.length; b++) {
             var btn = bubbles[b];
-            var emoji = '';
-            var lbl = btn.getAttribute('aria-label') || '';
-            var em = firstEmoji(lbl);
-            if (em) emoji = em;
-            if (!emoji) {
-                var img = btn.querySelector('[data-testid="reaction-bubble-item"] img[alt], img[alt]');
-                if (img) emoji = (img.getAttribute('alt') || '').trim();
+            var emojis = emojisFromBubble(btn);
+            if (emojis.length === 0) continue;
+            var totalCount = parseCount((btn.innerText || btn.textContent || ''));
+            if (emojis.length === 1) {
+                add(emojis[0], totalCount || 1, btn);
+            } else {
+                for (var k = 0; k < emojis.length; k++) {
+                    add(emojis[k], 1, btn);
+                }
             }
-            if (emoji) add(emoji, 1, btn);
         }
     }
 
@@ -720,20 +749,28 @@ return (function(row) {
             '[data-testid="reactions-read-more-container"],' +
             '[data-testid="reactions-container"],' +
             '[data-testid="msg-reactions"],' +
-            '[data-testid="reactions-bubble"]'
+            '[data-testid="reactions-bubble"],' +
+            '[data-testid="addon-bubble-container"]'
         );
         for (var c = 0; c < containers.length; c++) {
             var container = containers[c];
+            if (container.querySelector('[data-testid="reaction-bubble"]')) continue;
             var pills = container.querySelectorAll('[role="button"], button');
             for (var p = 0; p < pills.length; p++) {
                 var pill = pills[p];
                 var txt = (pill.innerText || pill.textContent || '').trim();
                 if (!txt) continue;
-                var emoji = firstEmoji(txt);
-                if (!emoji) continue;
-                var count = parseCount(txt.replace(emoji, ''));
+                var emojis = allEmojis(txt);
+                if (emojis.length === 0) continue;
+                var count = parseCount(txt);
                 if (count < 1) count = 1;
-                add(emoji, count, pill);
+                if (emojis.length === 1) {
+                    add(emojis[0], count, pill);
+                } else {
+                    for (var e = 0; e < emojis.length; e++) {
+                        add(emojis[e], 1, pill);
+                    }
+                }
             }
         }
     }
@@ -777,28 +814,43 @@ return (function(dialog, targetEmoji) {
         n = (n || '').trim();
         if (!n || n.length > 120) return true;
         if (/^\d+$/.test(n)) return true;
-        if (/^(All|הכל)$/i.test(n)) return true;
+        if (/^(All|הכל|כל)$/i.test(n)) return true;
         if (/^[\p{Extended_Pictographic}\p{Emoji}\u200d\uFE0F\s·•,]+$/u.test(n)) return true;
         return false;
     }
-    function addName(n) {
+    function cleanName(n) {
         n = (n || '').trim();
+        n = n.replace(/^~\s*/, '');
+        return n.trim();
+    }
+    function phoneFromText(s) {
+        var m = (s || '').match(/(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)/);
+        return m ? m[1].trim() : '';
+    }
+    function addName(n) {
+        n = cleanName(n);
         if (badName(n) || seen[n]) return;
         seen[n] = true;
         names.push(n);
     }
     function rowEmoji(el) {
         if (!el) return '';
+        var imgs = el.querySelectorAll('img[alt]');
+        for (var i = imgs.length - 1; i >= 0; i--) {
+            var alt = (imgs[i].getAttribute('alt') || '').trim();
+            var em = firstEmoji(alt);
+            if (em) return em;
+        }
         var img = el.querySelector('[data-testid="reaction-bubble-item"] img[alt], img[alt]');
         if (img) {
-            var alt = (img.getAttribute('alt') || '').trim();
-            if (alt) return firstEmoji(alt) || alt;
+            var alt2 = (img.getAttribute('alt') || '').trim();
+            if (alt2) return firstEmoji(alt2) || alt2;
         }
         var btn = el.querySelector('[data-testid="reaction-bubble"], [aria-label]');
         if (btn) {
             var lbl = btn.getAttribute('aria-label') || btn.textContent || '';
-            var em = firstEmoji(lbl);
-            if (em) return em;
+            var em2 = firstEmoji(lbl);
+            if (em2) return em2;
         }
         return firstEmoji(el.innerText || el.textContent || '');
     }
@@ -815,11 +867,27 @@ return (function(dialog, targetEmoji) {
             + '[data-testid="react-participant"]'
         );
         if (titleEl) {
-            var n = (titleEl.getAttribute('title')
+            var n = cleanName(
+                titleEl.getAttribute('title')
                 || titleEl.innerText
                 || titleEl.textContent
-                || '').trim();
+                || ''
+            );
             if (!badName(n)) { addName(n); return; }
+        }
+
+        var secondary = el.querySelector(
+            '[data-testid="cell-frame-secondary"],'
+            + '[data-testid="cell-frame-subtitle"]'
+        );
+        if (secondary) {
+            var sec = cleanName(
+                secondary.getAttribute('title')
+                || secondary.innerText
+                || secondary.textContent
+                || ''
+            );
+            if (!badName(sec)) { addName(sec); return; }
         }
 
         var picks = el.querySelectorAll('span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]');
@@ -827,13 +895,20 @@ return (function(dialog, targetEmoji) {
             var pick = picks[i];
             if (isTab(pick)) continue;
             if (pick.closest('[data-testid="reactions-tab"], [role="tablist"]')) continue;
-            n = (pick.getAttribute('title') || pick.innerText || pick.textContent || '').trim();
+            n = cleanName(pick.getAttribute('title') || pick.innerText || pick.textContent || '');
             if (!badName(n)) { addName(n); return; }
+        }
+
+        var phone = phoneFromText(el.innerText || el.textContent || '');
+        if (phone && !seen[phone]) {
+            seen[phone] = true;
+            names.push(phone);
+            return;
         }
 
         var lines = (el.innerText || el.textContent || '').split('\n');
         for (var j = 0; j < lines.length; j++) {
-            var line = lines[j].trim();
+            var line = cleanName(lines[j]);
             if (!badName(line)) { addName(line); return; }
         }
     }
@@ -867,6 +942,176 @@ return (function(dialog, targetEmoji) {
     }
     return names;
 })(arguments[0], arguments[1]);
+"""
+
+_JS_PARSE_REACTION_TABS = r"""
+return (function(dialog) {
+    var results = [];
+    var seen = {};
+
+    function firstEmoji(s) {
+        var m = (s || '').match(/\p{Extended_Pictographic}/u);
+        return m ? m[0] : '';
+    }
+    function normEmoji(s) {
+        return (s || '').replace(/[\uFE0E\uFE0F\u200D]/g, '');
+    }
+    function parseCount(s) {
+        var m = (s || '').match(/\d+/);
+        return m ? parseInt(m[0], 10) : 1;
+    }
+    function tabText(tab) {
+        return (
+            tab.getAttribute('aria-label')
+            || tab.getAttribute('title')
+            || tab.innerText
+            || tab.textContent
+            || ''
+        ).trim();
+    }
+    function isAllTab(txt) {
+        return /^(All|הכל|כל(?:\s+\d+)?|\d+\s+(?:reactions|תגובות))/i.test(txt);
+    }
+
+    var root = dialog.closest('[data-testid="drawer-right"]') || dialog;
+    var tabs = root.querySelectorAll('[data-testid="reactions-tab"], [role="tab"]');
+    for (var i = 0; i < tabs.length; i++) {
+        var tab = tabs[i];
+        var txt = tabText(tab);
+        if (!txt || isAllTab(txt)) continue;
+        var emoji = firstEmoji(txt);
+        if (!emoji) {
+            var img = tab.querySelector('img[alt]');
+            if (img) emoji = firstEmoji(img.getAttribute('alt') || '') || (img.getAttribute('alt') || '').trim();
+        }
+        if (!emoji) continue;
+        var key = normEmoji(emoji);
+        if (seen[key]) continue;
+        seen[key] = true;
+        var count = parseCount(txt.replace(emoji, ''));
+        if (count < 1) count = 1;
+        results.push({ emoji: emoji, count: count });
+    }
+    return results;
+})(arguments[0]);
+"""
+
+_JS_COLLECT_REACTORS_GROUPED = r"""
+return (function(dialog) {
+    var grouped = {};
+    var seenRows = {};
+
+    function normEmoji(s) {
+        return (s || '').replace(/[\uFE0E\uFE0F\u200D]/g, '');
+    }
+    function firstEmoji(s) {
+        var m = (s || '').match(/\p{Extended_Pictographic}/u);
+        return m ? m[0] : '';
+    }
+    function badName(n) {
+        n = (n || '').trim();
+        if (!n || n.length > 120) return true;
+        if (/^\d+$/.test(n)) return true;
+        if (/^(All|הכל|כל)$/i.test(n)) return true;
+        if (/^[\p{Extended_Pictographic}\p{Emoji}\u200d\uFE0F\s·•,]+$/u.test(n)) return true;
+        return false;
+    }
+    function cleanName(n) {
+        n = (n || '').trim().replace(/^~\s*/, '');
+        return n.trim();
+    }
+    function phoneFromText(s) {
+        var m = (s || '').match(/(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)/);
+        return m ? m[1].trim() : '';
+    }
+    function rowEmoji(el) {
+        if (!el) return '';
+        var imgs = el.querySelectorAll('img[alt]');
+        for (var i = imgs.length - 1; i >= 0; i--) {
+            var em = firstEmoji(imgs[i].getAttribute('alt') || '');
+            if (em) return em;
+        }
+        return firstEmoji(el.innerText || el.textContent || '');
+    }
+    function nameFromRow(el) {
+        if (!el) return '';
+        var titleEl = el.querySelector(
+            '[data-testid="cell-frame-title"] span[title],'
+            + '[data-testid="cell-frame-title"] span[dir],'
+            + 'span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]'
+        );
+        if (titleEl) {
+            var n = cleanName(
+                titleEl.getAttribute('title')
+                || titleEl.innerText
+                || titleEl.textContent
+                || ''
+            );
+            if (!badName(n)) return n;
+        }
+        var phone = phoneFromText(el.innerText || el.textContent || '');
+        if (phone) return phone;
+        var lines = (el.innerText || el.textContent || '').split('\n');
+        for (var j = 0; j < lines.length; j++) {
+            var line = cleanName(lines[j]);
+            if (!badName(line)) return line;
+        }
+        return '';
+    }
+    function addToGroup(em, n) {
+        em = em || 'unknown';
+        n = cleanName(n);
+        if (!n || badName(n)) return;
+        var key = normEmoji(em) || em;
+        if (!grouped[key]) grouped[key] = { emoji: em, senders: [], seen: {} };
+        if (grouped[key].seen[n]) return;
+        grouped[key].seen[n] = true;
+        grouped[key].senders.push(n);
+    }
+    function collect(root) {
+        if (!root) return;
+        var rows = root.querySelectorAll(
+            '[data-testid="react-participant"],'
+            + '[data-testid="reactions-list-item"],'
+            + '[role="listitem"],'
+            + '[data-testid="cell-frame-container"]'
+        );
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            var rowKey = row.innerText || row.textContent || String(i);
+            if (seenRows[rowKey]) continue;
+            seenRows[rowKey] = true;
+            var em = rowEmoji(row);
+            var n = nameFromRow(row);
+            if (n) addToGroup(em, n);
+        }
+    }
+
+    var root = dialog.closest('[data-testid="drawer-right"]') || dialog;
+    var scrollEl = root.querySelector('[data-testid="scrollable-content"]')
+        || root.querySelector('[data-scrolltraceid]')
+        || root.querySelector('[data-testid="reactions-list"] [role="list"]')
+        || root.querySelector('[role="list"]')
+        || root.querySelector('[data-testid="reactions-list"]')
+        || dialog;
+    collect(scrollEl);
+    var lastTop = -1;
+    for (var attempt = 0; attempt < 50; attempt++) {
+        scrollEl.scrollTop += Math.max(120, Math.floor(scrollEl.clientHeight * 0.6));
+        if (scrollEl.scrollTop === lastTop) break;
+        lastTop = scrollEl.scrollTop;
+        collect(scrollEl);
+    }
+
+    var out = [];
+    for (var k in grouped) {
+        if (!grouped.hasOwnProperty(k)) continue;
+        var g = grouped[k];
+        if (g.emoji === 'unknown') continue;
+        out.push({ emoji: g.emoji, count: g.senders.length, senders: g.senders });
+    }
+    return out;
+})(arguments[0]);
 """
 
 _JS_SCROLL_HELPERS = r"""
@@ -2087,12 +2332,8 @@ def _collect_reaction_senders(
     return senders
 
 
-def _find_reaction_click_target(row_el, emoji: str):
-    """Locate the element to click to open the reactions drawer."""
-    pill = _find_reaction_pill(row_el, emoji)
-    if pill:
-        return pill
-
+def _find_reaction_container(row_el):
+    """Locate the combined reaction pill / container for a message."""
     scopes = [row_el]
     try:
         scopes.append(row_el.find_element(By.XPATH, ".."))
@@ -2108,17 +2349,18 @@ def _find_reaction_click_target(row_el, emoji: str):
     except (NoSuchElementException, StaleElementReferenceException):
         pass
 
+    selectors = (
+        '[data-testid="reaction-bubble"]',
+        '[data-testid="reactions-read-more-container"]',
+        '[data-testid="addon-bubble-container"]',
+        S["rxn_container"],
+    )
     seen = set()
     for scope in scopes:
         if id(scope) in seen:
             continue
         seen.add(id(scope))
-
-        for sel in (
-            '[data-testid="reactions-read-more-container"]',
-            '[data-testid="addon-bubble-container"]',
-            S["rxn_container"],
-        ):
+        for sel in selectors:
             for target in find_all(scope, sel):
                 try:
                     if target.is_displayed():
@@ -2126,6 +2368,15 @@ def _find_reaction_click_target(row_el, emoji: str):
                 except StaleElementReferenceException:
                     continue
     return None
+
+
+def _find_reaction_click_target(row_el, emoji: str = ""):
+    """Locate the element to click to open the reactions drawer."""
+    if emoji:
+        pill = _find_reaction_pill(row_el, emoji)
+        if pill:
+            return pill
+    return _find_reaction_container(row_el)
 
 
 def _find_reaction_pill(row_el, emoji: str):
@@ -2187,9 +2438,19 @@ def _dismiss_reaction_dialog(driver) -> None:
 
 def _click_reaction_tab(driver, dialog, emoji: str) -> None:
     """Select the emoji tab inside the reactions drawer when present."""
-    tabs = find_all(dialog, S["rxn_tab"])
+    root = dialog
+    try:
+        drawer = dialog.find_element(
+            By.XPATH,
+            "./ancestor::*[@data-testid='drawer-right'][1]",
+        )
+        root = drawer
+    except (NoSuchElementException, StaleElementReferenceException):
+        pass
+
+    tabs = find_all(root, S["rxn_tab"])
     if not tabs:
-        tabs = find_all(dialog, '[role="tab"]')
+        tabs = find_all(root, '[role="tab"]')
     if not tabs:
         return
 
@@ -2209,43 +2470,88 @@ def _click_reaction_tab(driver, dialog, emoji: str) -> None:
             continue
 
 
+def _parse_reactions_from_dialog(driver, dialog) -> List[Reaction]:
+    """Read emoji tabs + senders from an already-open reactions drawer."""
+    try:
+        tabs_raw = driver.execute_script(_JS_PARSE_REACTION_TABS, dialog) or []
+    except Exception:
+        tabs_raw = []
+
+    if tabs_raw:
+        detailed: List[Reaction] = []
+        for tab_info in tabs_raw:
+            emoji = tab_info.get("emoji", "")
+            if not emoji:
+                continue
+            count = int(tab_info.get("count", 1))
+            _click_reaction_tab(driver, dialog, emoji)
+            jitter(0.2, 0.4)
+            senders = _collect_reaction_senders(driver, dialog, emoji)
+            if not senders:
+                senders = _collect_reaction_senders(driver, dialog, "")
+            detailed.append(Reaction(emoji=emoji, count=count, senders=senders))
+        return detailed
+
+    try:
+        grouped_raw = driver.execute_script(_JS_COLLECT_REACTORS_GROUPED, dialog) or []
+        if grouped_raw:
+            return [
+                Reaction(
+                    emoji=item["emoji"],
+                    count=int(item.get("count", len(item.get("senders", [])))),
+                    senders=[str(s).strip() for s in item.get("senders", []) if str(s).strip()],
+                )
+                for item in grouped_raw
+                if item.get("emoji")
+            ]
+    except Exception:
+        pass
+
+    senders = _collect_reaction_senders(driver, dialog, "")
+    if senders:
+        return [Reaction(emoji="", count=len(senders), senders=senders)]
+    return []
+
+
 def _parse_reactions_detail(driver, row_el) -> List[Reaction]:
     """
-    Click each reaction pill to open the 'who reacted' dialog, scroll the
-    participant list, then harvest names.  Much slower – use only with
-    --reactions-detail.
-
-    Uses JS click (no scrollIntoView) so the message panel position is kept.
+    Open the reactions drawer once, read per-emoji tabs for counts, then
+    collect senders from each tab.
     """
-    basic    = _parse_reactions_basic(driver, row_el)
-    detailed = []
+    target = _find_reaction_click_target(row_el, "")
+    if not target:
+        return _parse_reactions_basic(driver, row_el)
 
-    for rxn in basic:
-        senders: List[str] = []
-        target = _find_reaction_click_target(row_el, rxn.emoji)
+    try:
+        driver.execute_script("arguments[0].click();", target)
+        jitter(0.45, 0.9)
 
-        if target:
-            try:
-                driver.execute_script("arguments[0].click();", target)
-                jitter(0.45, 0.9)
+        dialog = _wait_for_reaction_dialog(driver)
+        detailed = _parse_reactions_from_dialog(driver, dialog)
+        _dismiss_reaction_dialog(driver)
 
-                dialog = _wait_for_reaction_dialog(driver)
-                _click_reaction_tab(driver, dialog, rxn.emoji)
-                jitter(0.2, 0.4)
-                senders = _collect_reaction_senders(driver, dialog, rxn.emoji)
+        if detailed:
+            # Drop placeholder rows with no emoji (All-tab fallback).
+            cleaned = [r for r in detailed if r.emoji]
+            if cleaned:
+                return cleaned
+            only = detailed[0]
+            basic = _parse_reactions_basic(driver, row_el)
+            if basic and only.senders:
+                return [
+                    Reaction(
+                        emoji=rxn.emoji,
+                        count=rxn.count,
+                        senders=only.senders if len(basic) == 1 else [],
+                    )
+                    for rxn in basic
+                ]
 
-                if not senders and rxn.count == 1:
-                    senders = _collect_reaction_senders(driver, dialog, "")
+    except (TimeoutException, StaleElementReferenceException,
+            ElementNotInteractableException):
+        _dismiss_reaction_dialog(driver)
 
-                _dismiss_reaction_dialog(driver)
-
-            except (TimeoutException, StaleElementReferenceException,
-                    ElementNotInteractableException):
-                _dismiss_reaction_dialog(driver)
-
-        detailed.append(Reaction(emoji=rxn.emoji, count=rxn.count, senders=senders))
-
-    return detailed
+    return _parse_reactions_basic(driver, row_el)
 
 
 def _parse_message(
