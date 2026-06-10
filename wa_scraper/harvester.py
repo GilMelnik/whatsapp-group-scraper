@@ -24,17 +24,15 @@ class MessageHarvester:
     def __init__(
         self,
         driver,
-        reactions_detail: bool = True,
         scroll_pause: float = 1.0,
         max_top_scrolls: int = 6000,
         max_down_passes: int = 10,
     ) -> None:
         self.driver = driver
-        self.reactions_detail = reactions_detail
         self.scroll_pause = scroll_pause
         self.max_top_scrolls = max_top_scrolls
         self.max_down_passes = max_down_passes
-        self._extractor = MessageExtractor(driver, reactions_detail)
+        self._extractor = MessageExtractor(driver)
 
     def _panel_items(self, panel):
         try:
@@ -93,10 +91,7 @@ class MessageHarvester:
                 " while harvesting."
             )
 
-        if self.reactions_detail:
-            log("↓  Reading messages and collecting reactors …")
-        else:
-            log("↓  Reading messages …")
+        log("↓  Reading messages and collecting reactors …")
         jitter(0.8, 1.4)
 
         messages: Dict[str, Message] = {}

@@ -23,7 +23,6 @@ class ScraperConfig:
     scroll_pause: float = 1.0
     max_top_scrolls: int = 6000
     max_down_passes: int = 3
-    reactions_detail: bool = True
 
 
 class WhatsAppScraper:
@@ -46,12 +45,10 @@ class WhatsAppScraper:
 
             harvester = MessageHarvester(
                 driver,
-                reactions_detail=self.config.reactions_detail,
                 scroll_pause=self.config.scroll_pause,
                 max_top_scrolls=self.config.max_top_scrolls,
                 max_down_passes=self.config.max_down_passes,
             )
             return harvester.scrape()
         finally:
-            input("\nPress Enter to close the browser …")
             self._session.quit()

@@ -27,9 +27,8 @@ from wa_scraper.utils import find, find_all
 class MessageExtractor:
     """Parses a single message row into a Message dataclass."""
 
-    def __init__(self, driver, reactions_detail: bool = True) -> None:
+    def __init__(self, driver) -> None:
         self.driver = driver
-        self.reactions_detail = reactions_detail
         self._reactions = ReactionExtractor(driver)
 
     def message_id(self, row_el) -> str:
@@ -260,10 +259,7 @@ class MessageExtractor:
                 return None
 
             scope = self.reaction_scope(row_el)
-            if self.reactions_detail:
-                reactions = self._reactions.parse_detail(scope)
-            else:
-                reactions = self._reactions.parse_basic(scope)
+            reactions = self._reactions.parse(scope)
 
             return Message(
                 id=mid,

@@ -1,36 +1,28 @@
-"""Reaction parsing from inline pills and the reactions drawer."""
+"""Reaction parsing from the reactions drawer (reactor users only)."""
 
 from __future__ import annotations
 
 import re
 import time
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from selenium.common.exceptions import (
     ElementNotInteractableException,
+    NoSuchElementException,
     StaleElementReferenceException,
-    TimeoutException, NoSuchElementException,
+    TimeoutException,
 )
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
+from wa_scraper.contact import Contact, dedupe_contacts, parse_contact
 from wa_scraper.js.reactions import (
-    _JS_COLLECT_REACTORS,
     _JS_COLLECT_REACTORS_GROUPED,
-    _JS_EXPECTED_REACTION_COUNT,
     _JS_FIND_REACTIONS_OVERLAY,
+    _JS_FIRST_EMOJI,
     _JS_HAS_REACTION_PARTICIPANTS,
-    _JS_PARSE_REACTION_TABS,
-    _JS_REACTIONS,
-)
-from wa_scraper.contact import (
-    Contact,
-    contact_dedup_key,
-    dedupe_contacts,
-    extract_phone,
-    parse_contact,
 )
 from wa_scraper.models import Reaction
 from wa_scraper.selectors import S
@@ -43,11 +35,40 @@ from wa_scraper.utils import (
     normalize_emoji,
 )
 
+
 class ReactionExtractor:
-    """Extracts emoji reactions and optional reactor names from message rows."""
+    """Extracts emoji reactions by scraping every reactor from the drawer."""
 
     def __init__(self, driver) -> None:
         self.driver = driver
+
+    def parse(self, row_el) -> List[Reaction]:
+        if not self._has_reactions(row_el):
+            return []
+
+        target = self._find_click_target(row_el)
+        if not target:
+            return []
+
+        try:
+            click_element(self.driver, target)
+            jitter(0.45, 0.9)
+            dialog = self._wait_for_dialog()
+            self._wait_for_participants(dialog)
+            jitter(0.2, 0.4)
+            reactions = self._collect_from_dialog(dialog)
+            self._dismiss_dialog()
+            return reactions
+        except (
+            TimeoutException,
+            StaleElementReferenceException,
+            ElementNotInteractableException,
+        ):
+            self._dismiss_dialog()
+            return []
+
+    def _has_reactions(self, row_el) -> bool:
+        return self._find_container(row_el) is not None
 
     def _wait_for_dialog(self, timeout: float = 8.0):
         deadline = time.time() + timeout
@@ -123,202 +144,6 @@ class ReactionExtractor:
         except TimeoutException:
             pass
 
-    def parse_basic(self, row_el) -> List[Reaction]:
-        try:
-            raw = self.driver.execute_script(_JS_REACTIONS, row_el) or []
-            return [
-                Reaction(emoji=item["emoji"], count=int(item.get("count", 1)), senders=[])
-                for item in raw
-                if item.get("emoji")
-            ]
-        except Exception:
-            pass
-
-        results: List[Reaction] = []
-        for container in find_all(row_el, S["rxn_container"]):
-            try:
-                spans = container.find_elements(By.TAG_NAME, "span")
-                emoji = ""
-                count = 1
-                for sp in spans:
-                    t = sp.text.strip()
-                    if not t:
-                        continue
-                    if t.isdigit():
-                        count = int(t)
-                    else:
-                        if emoji:
-                            results.append(
-                                Reaction(emoji=emoji, count=count, senders=[])
-                            )
-                        emoji = t
-                        count = 1
-                if emoji:
-                    results.append(Reaction(emoji=emoji, count=count, senders=[]))
-            except StaleElementReferenceException:
-                pass
-        return results
-
-    def _collect_senders(self, dialog, emoji: str = "") -> List[Contact]:
-        expected_count = 0
-        try:
-            expected_count = int(
-                self.driver.execute_script(_JS_EXPECTED_REACTION_COUNT, dialog) or 0
-            )
-        except Exception:
-            pass
-
-        try:
-            raw_reactors = (
-                self.driver.execute_script(_JS_COLLECT_REACTORS, dialog, emoji) or []
-            )
-            parsed = [
-                r
-                for r in (parse_contact(raw) for raw in raw_reactors)
-                if r is not None
-            ]
-            cleaned = dedupe_contacts(parsed)
-            if cleaned and (not expected_count or len(cleaned) >= expected_count):
-                return cleaned
-        except Exception:
-            pass
-
-        senders: List[Contact] = []
-        seen: set = set()
-
-        def add_reactor(user_name: str = "", phone: str = "") -> bool:
-            reactor = parse_contact({"user_name": user_name, "phone": phone})
-            if reactor is None:
-                return False
-            if reactor.user_name and re.fullmatch(r"\d+", reactor.user_name):
-                return False
-            key = contact_dedup_key(reactor)
-            if key in seen:
-                return False
-            seen.add(key)
-            senders.append(reactor)
-            return True
-
-        try:
-            root = self.driver.execute_script(_JS_FIND_REACTIONS_OVERLAY, dialog)
-        except Exception:
-            root = dialog
-        if not root:
-            root = dialog
-
-        scroll_el = (
-            find(root, S["rxn_scroll"])
-            or find(root, '[data-testid="reactions-list"]')
-            or find(root, '[role="list"]')
-            or find(root, S["rxn_dialog"])
-            or root
-        )
-
-        for _ in range(50):
-            for row in find_all(root, S["rxn_row"]):
-                try:
-                    role = (row.get_attribute("role") or "").lower()
-                    testid = row.get_attribute("data-testid") or ""
-                    aria = (row.get_attribute("aria-label") or "").strip()
-                    if role == "tab" or testid == "reactions-tab":
-                        continue
-                    if role == "listitem" and not re.search(
-                        r"\breacted\s+with\b", aria, re.I
-                    ) and find(
-                        row,
-                        (
-                            '[data-testid="reactions-details-cell-not-me"],'
-                            '[data-testid="reactions-details-cell-me"],'
-                            '[data-testid="react-participant"]'
-                        ),
-                    ):
-                        continue
-
-                    reacted = re.match(r"^(.+?)\s+reacted\s+with\b", aria, re.I)
-                    if reacted:
-                        parsed = parse_contact(reacted.group(1).strip())
-                        if parsed and add_reactor(parsed.user_name, parsed.phone or ""):
-                            continue
-
-                    if role != "listitem":
-                        aria = (
-                            self.driver.execute_script(
-                                """
-                                var el = arguments[0];
-                                var row = el.closest(
-                                    '[role="listitem"][aria-label*="reacted"]'
-                                );
-                                return row ? (row.getAttribute('aria-label') || '') : '';
-                                """,
-                                row,
-                            )
-                            or ""
-                        ).strip()
-                        reacted = re.match(r"^(.+?)\s+reacted\s+with\b", aria, re.I)
-                        if reacted:
-                            parsed = parse_contact(reacted.group(1).strip())
-                            if parsed and add_reactor(
-                                parsed.user_name, parsed.phone or ""
-                            ):
-                                continue
-                except StaleElementReferenceException:
-                    continue
-
-                user_name = ""
-                phone = ""
-                title_el = find(row, '[data-testid="cell-frame-title"] span[dir],'
-                                '[data-testid="cell-frame-title"] span[title]')
-                if title_el:
-                    user_name = (
-                        title_el.get_attribute("title") or title_el.text or ""
-                    ).strip()
-
-                secondary_el = find(
-                    row,
-                    '[data-testid="cell-frame-secondary"],'
-                    '[data-testid="cell-frame-subtitle"]',
-                )
-                if secondary_el:
-                    sec_text = (
-                        secondary_el.get_attribute("title") or secondary_el.text or ""
-                    ).strip()
-                    phone = extract_phone(sec_text) or sec_text
-
-                if user_name and add_reactor(user_name, phone):
-                    continue
-
-                for name_el in find_all(row, S["rxn_name"]):
-                    n = (name_el.get_attribute("title") or name_el.text or "").strip()
-                    if n and add_reactor(n, phone):
-                        break
-                else:
-                    if not find_all(row, S["rxn_name"]):
-                        for sp in find_all(row, 'span[title], span[dir="auto"]'):
-                            n = (sp.get_attribute("title") or sp.text or "").strip()
-                            if n and add_reactor(n, phone):
-                                break
-                    elif phone:
-                        add_reactor("", phone)
-
-            try:
-                prev = self.driver.execute_script(
-                    "return arguments[0].scrollTop;", scroll_el
-                )
-                self.driver.execute_script(
-                    "arguments[0].scrollTop += Math.max(120, arguments[0].clientHeight * 0.6);",
-                    scroll_el,
-                )
-                cur = self.driver.execute_script(
-                    "return arguments[0].scrollTop;", scroll_el
-                )
-                if cur == prev:
-                    break
-            except Exception:
-                break
-            jitter(0.1, 0.25)
-
-        return senders
-
     def _find_container(self, row_el):
         scopes = [row_el]
         try:
@@ -355,60 +180,7 @@ class ReactionExtractor:
                         continue
         return None
 
-    def _find_pill(self, row_el, emoji: str):
-        scopes = [row_el]
-        try:
-            scopes.append(row_el.find_element(By.XPATH, ".."))
-        except (NoSuchElementException, StaleElementReferenceException):
-            pass
-        try:
-            root = row_el.find_element(
-                By.XPATH,
-                "./ancestor::div[contains(@class,'focusable-list-item')]",
-            )
-            scopes.append(root)
-        except (NoSuchElementException, StaleElementReferenceException):
-            pass
-
-        seen = set()
-        for scope in scopes:
-            if id(scope) in seen:
-                continue
-            seen.add(id(scope))
-            for pill in find_all(scope, S["rxn_pill"]):
-                try:
-                    txt = pill.text.strip()
-                    aria = (pill.get_attribute("aria-label") or "").strip()
-                    if emoji_matches(emoji, txt) or emoji_matches(emoji, aria):
-                        return pill
-                except StaleElementReferenceException:
-                    continue
-
-            for container in find_all(scope, '[data-testid="addon-bubble-container"]'):
-                for pill in find_all(container, '[data-testid="reaction-bubble"]'):
-                    try:
-                        aria = (pill.get_attribute("aria-label") or "").strip()
-                        if emoji_matches(emoji, pill.text.strip()) or emoji_matches(
-                            emoji, aria
-                        ):
-                            return pill
-                    except StaleElementReferenceException:
-                        continue
-
-            for container in find_all(scope, S["rxn_container"]):
-                for pill in find_all(container, '[role="button"], button'):
-                    try:
-                        if emoji_matches(emoji, pill.text.strip()):
-                            return pill
-                    except StaleElementReferenceException:
-                        continue
-        return None
-
-    def _find_click_target(self, row_el, emoji: str = ""):
-        if emoji:
-            pill = self._find_pill(row_el, emoji)
-            if pill:
-                return pill
+    def _find_click_target(self, row_el):
         return self._find_container(row_el)
 
     def _dismiss_dialog(self) -> None:
@@ -418,9 +190,64 @@ class ReactionExtractor:
         except Exception:
             pass
 
-    def _click_tab(self, dialog, emoji: str) -> None:
-        from selenium.common.exceptions import NoSuchElementException
+    def _first_emoji(self, text: str) -> str:
+        try:
+            return (
+                self.driver.execute_script(_JS_FIRST_EMOJI, text or "") or ""
+            ).strip()
+        except Exception:
+            return ""
 
+    def _tab_emojis(self, dialog) -> List[str]:
+        root = dialog
+        try:
+            drawer = dialog.find_element(
+                By.XPATH,
+                "./ancestor::*[@data-testid='drawer-right'][1]",
+            )
+            root = drawer
+        except (NoSuchElementException, StaleElementReferenceException):
+            pass
+
+        tabs = find_all(root, S["rxn_tab"])
+        if not tabs:
+            tabs = find_all(root, '[role="tab"]')
+
+        emojis: List[str] = []
+        seen: set[str] = set()
+        for tab in tabs:
+            try:
+                txt = (
+                    tab.get_attribute("aria-label")
+                    or tab.get_attribute("title")
+                    or tab.text
+                    or ""
+                ).strip()
+                if re.match(
+                    r"^(All|הכל|כל(?:\s+\d+)?|\d+\s+(?:reactions|תגובות))",
+                    txt,
+                    re.I,
+                ):
+                    continue
+
+                emoji = self._first_emoji(txt)
+                if not emoji:
+                    img = find(tab, "img[alt]")
+                    if img:
+                        emoji = self._first_emoji(img.get_attribute("alt") or "")
+                if not emoji:
+                    continue
+
+                key = normalize_emoji(emoji)
+                if key in seen:
+                    continue
+                seen.add(key)
+                emojis.append(emoji)
+            except StaleElementReferenceException:
+                continue
+        return emojis
+
+    def _click_tab(self, dialog, emoji: str) -> None:
         root = dialog
         try:
             drawer = dialog.find_element(
@@ -452,30 +279,31 @@ class ReactionExtractor:
             except StaleElementReferenceException:
                 continue
 
-
     def _grouped_to_reactions(self, grouped_raw: List[dict]) -> List[Reaction]:
-        return [
-            Reaction(
-                emoji=item["emoji"],
-                count=int(item.get("count", len(item.get("senders", [])))),
-                senders=dedupe_contacts(
-                    [
-                        r
-                        for r in (
-                            parse_contact(s) for s in item.get("senders", [])
-                        )
-                        if r is not None
-                    ]
-                ),
+        reactions: List[Reaction] = []
+        for item in grouped_raw:
+            emoji = item.get("emoji")
+            if not emoji:
+                continue
+            senders = dedupe_contacts(
+                [
+                    r
+                    for r in (parse_contact(s) for s in item.get("senders", []))
+                    if r is not None
+                ]
             )
-            for item in grouped_raw
-            if item.get("emoji")
-        ]
+            if not senders:
+                continue
+            reactions.append(
+                Reaction(emoji=emoji, count=len(senders), senders=senders)
+            )
+        return reactions
 
     def _collect_grouped_from_dialog(self, dialog) -> List[Reaction]:
         try:
             grouped_raw = (
-                self.driver.execute_script(_JS_COLLECT_REACTORS_GROUPED, dialog) or []
+                self.driver.execute_script(_JS_COLLECT_REACTORS_GROUPED, dialog)
+                or []
             )
             if grouped_raw:
                 return self._grouped_to_reactions(grouped_raw)
@@ -483,83 +311,43 @@ class ReactionExtractor:
             pass
         return []
 
-    def _parse_from_dialog(
-        self, dialog, basic: List[Reaction]
-    ) -> List[Reaction]:
+    def _collect_from_dialog(self, dialog) -> List[Reaction]:
         grouped = self._collect_grouped_from_dialog(dialog)
-        if grouped and any(r.senders for r in grouped):
+        if grouped:
             return grouped
 
-        try:
-            tabs_raw = self.driver.execute_script(_JS_PARSE_REACTION_TABS, dialog) or []
-        except Exception:
-            tabs_raw = []
-
-        if tabs_raw:
-            detailed: List[Reaction] = []
-            for tab_info in tabs_raw:
-                emoji = tab_info.get("emoji", "")
-                if not emoji:
-                    continue
-                count = int(tab_info.get("count", 1))
-                self._click_tab(dialog, emoji)
-                self._wait_for_participants(dialog)
-                jitter(0.2, 0.4)
-                tab_grouped = self._collect_grouped_from_dialog(dialog)
-                senders: List[Contact] = []
-                for rxn in tab_grouped:
-                    if emoji_matches(emoji, rxn.emoji):
-                        senders = rxn.senders
-                        break
-                detailed.append(Reaction(emoji=emoji, count=count, senders=senders))
-            if any(r.senders for r in detailed):
-                return detailed
-
-        return []
-
-    @staticmethod
-    def _merge_senders(
-        basic: List[Reaction], detailed: List[Reaction]
-    ) -> List[Reaction]:
-        by_emoji: Dict[str, Reaction] = {}
-        for rxn in detailed:
-            key = normalize_emoji(rxn.emoji)
-            if key and key not in by_emoji:
-                by_emoji[key] = rxn
-
-        merged: List[Reaction] = []
-        for rxn in basic:
-            key = normalize_emoji(rxn.emoji)
-            detail = by_emoji.get(key)
-            senders = detail.senders if detail and detail.senders else []
-            count = rxn.count if rxn.count else (detail.count if detail else 1)
-            merged.append(Reaction(emoji=rxn.emoji, count=count, senders=senders))
-        return merged
-
-    def parse_detail(self, row_el) -> List[Reaction]:
-        basic = self.parse_basic(row_el)
-        if not basic:
-            return []
-
-        target = self._find_click_target(row_el, "")
-        if not target:
-            return basic
-
-        try:
-            click_element(self.driver, target)
-            jitter(0.45, 0.9)
-            dialog = self._wait_for_dialog()
+        detailed: List[Reaction] = []
+        seen: set[str] = set()
+        for emoji in self._tab_emojis(dialog):
+            self._click_tab(dialog, emoji)
             self._wait_for_participants(dialog)
             jitter(0.2, 0.4)
-            batch = self._parse_from_dialog(dialog, basic)
-            self._dismiss_dialog()
-            if batch and any(r.senders for r in batch):
-                return self._merge_senders(basic, batch)
-        except (
-            TimeoutException,
-            StaleElementReferenceException,
-            ElementNotInteractableException,
-        ):
-            self._dismiss_dialog()
 
-        return basic
+            senders: List[Contact] = []
+            resolved_emoji = emoji
+            for rxn in self._collect_grouped_from_dialog(dialog):
+                if emoji_matches(emoji, rxn.emoji):
+                    senders = rxn.senders
+                    resolved_emoji = rxn.emoji
+                    break
+            if not senders:
+                tab_grouped = self._collect_grouped_from_dialog(dialog)
+                if len(tab_grouped) == 1 and tab_grouped[0].senders:
+                    resolved_emoji = tab_grouped[0].emoji or emoji
+                    senders = tab_grouped[0].senders
+
+            if not senders:
+                continue
+
+            key = normalize_emoji(resolved_emoji)
+            if key in seen:
+                continue
+            seen.add(key)
+            detailed.append(
+                Reaction(
+                    emoji=resolved_emoji,
+                    count=len(senders),
+                    senders=senders,
+                )
+            )
+        return detailed

@@ -53,7 +53,7 @@ Captured fields
   • quote        – { sender: { user_name, phone }, text } or null
   • reactions    – list of { emoji, count, senders[] }
                    senders lists who reacted as { user_name, phone }
-                   (disable with --no-reactions-detail)
+                   count is always len(senders)
   • media_type   – "image" | "video" | "audio" | "sticker" | "document"
                    "gif" | "location" | null
 
@@ -65,7 +65,6 @@ Usage
 ─────
   python whatsapp_scraper.py --group "My Group"
   python whatsapp_scraper.py --group "Team Chat" --output team.json
-  python whatsapp_scraper.py --group "Team Chat" --no-reactions-detail
   python whatsapp_scraper.py --group "Team Chat" --scroll-pause 1.5
 
 Notes
@@ -76,8 +75,7 @@ Notes
     human-like timing and random-step scrolling.
   • WhatsApp Web uses a virtual list – rows outside the viewport are removed
     from the DOM, so messages are harvested progressively as you scroll.
-  • Reactor names are collected by default by opening the reactions drawer.
-  • --no-reactions-detail skips reactor lookup (emoji + count only, faster).
+  • Reactor names are collected by opening the reactions drawer.
   • Scrolling uses visible message row heights so the harvest pass does not skip rows.
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -122,11 +120,6 @@ def main() -> None:
         default=3,
         help="Max downward scroll passes when reading messages (default: 3).",
     )
-    ap.add_argument(
-        "--no-reactions-detail",
-        action="store_true",
-        help="Skip opening reaction drawers (emoji + count only, faster).",
-    )
     args = ap.parse_args()
 
     try:
@@ -141,7 +134,6 @@ def main() -> None:
         scroll_pause=args.scroll_pause,
         max_top_scrolls=args.max_top_scrolls,
         max_down_passes=args.max_down_passes,
-        reactions_detail=not args.no_reactions_detail,
     )
 
     scraper = WhatsAppScraper(config)
