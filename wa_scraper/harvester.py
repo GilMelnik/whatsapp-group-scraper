@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from typing import Dict, List, Tuple
 
 from selenium.common.exceptions import StaleElementReferenceException
@@ -14,7 +14,7 @@ from wa_scraper.extraction.message import MessageExtractor
 from wa_scraper.js.scroll import (
     _JS_CHAT_ITEMS,
     _JS_DATE_FOR_ROW,
-    _JS_DISCOVER_DATE,
+    _JS_FIND_DATE_ABOVE,
     _JS_TOPMOST_NEEDS_DATE,
 )
 from wa_scraper.localization import is_date_label, normalize_date_impl
@@ -37,7 +37,6 @@ class MessageHarvester:
         self.scroll_pause = scroll_pause
         self.max_top_scrolls = max_top_scrolls
         self._extractor = MessageExtractor(driver)
-        self._date_fallback_warned = False
         self._dates_logged = False
 
     def _panel_items(self, panel):
@@ -61,9 +60,9 @@ class MessageHarvester:
             return ""
         return normalize_date_impl(raw)
 
-    def _discover_date(self, panel) -> str:
+    def _find_date_above(self, panel) -> str:
         try:
-            raw = self.driver.execute_script(_JS_DISCOVER_DATE, panel, 48)
+            raw = self.driver.execute_script(_JS_FIND_DATE_ABOVE, panel)
             if isinstance(raw, str) and raw.strip():
                 return self._normalize_date(raw)
         except Exception:
@@ -79,12 +78,18 @@ class MessageHarvester:
             pass
         return ""
 
-    def _resolve_message_date(self, panel, row_el, walk_date: str) -> str:
-        """Resolve a message date from DOM separators only — never stale carry-over."""
+    def _resolve_date(
+        self,
+        panel,
+        row_el,
+        walk_date: str,
+        *,
+        separator_seen_above: bool,
+    ) -> str:
         row_date = self._date_for_row(panel, row_el)
         if row_date:
             return row_date
-        if walk_date:
+        if separator_seen_above and walk_date:
             return walk_date
         return ""
 
@@ -95,6 +100,25 @@ class MessageHarvester:
             )
         except Exception:
             return False
+
+    def _ensure_date_context(
+        self, panel, scroller, current_date: str, *, max_steps: int = 120
+    ) -> str:
+        """Scroll up with the panel scroller until a date card applies to the top rows."""
+        for _ in range(max_steps):
+            found = self._find_date_above(panel)
+            if found:
+                return found
+            if not self._topmost_visible_needs_date(panel):
+                return current_date
+
+            scroller.wait_no_spinner()
+            scroll_result = scroller.scroll_up_from_anchor(None)
+            if scroll_result.get("stuck"):
+                scroller.scroll_fallback("up")
+            jitter(0.15, 0.35)
+
+        return self._find_date_above(panel) or current_date
 
     def _ordered_panel_rows(self, panel) -> List:
         rows: List = []
@@ -150,6 +174,7 @@ class MessageHarvester:
         has_message_items = any(item.get("kind") == "message" for item in items)
 
         if has_message_items:
+            separator_top: float | None = None
             for item in items:
                 try:
                     kind = item.get("kind")
@@ -158,6 +183,7 @@ class MessageHarvester:
                         normalized = self._normalize_date(raw)
                         if normalized:
                             current_date = normalized
+                            separator_top = item.get("top", 0)
                         continue
 
                     if kind != "message":
@@ -167,14 +193,30 @@ class MessageHarvester:
                     if not row_el:
                         continue
 
+                    seen_below_separator = (
+                        separator_top is not None
+                        and item.get("top", 0) > separator_top + 1
+                    )
                     mid = self._extractor.message_id(row_el)
                     if mid and mid in messages:
-                        msg_date = self._resolve_date(panel, row_el, current_date)
+                        msg_date = self._resolve_date(
+                            panel,
+                            row_el,
+                            current_date,
+                            separator_seen_above=seen_below_separator,
+                        )
                         if msg_date:
                             current_date = msg_date
                         continue
 
-                    msg_date = self._resolve_date(panel, row_el, current_date)
+                    msg_date = self._resolve_date(
+                        panel,
+                        row_el,
+                        current_date,
+                        separator_seen_above=seen_below_separator,
+                    )
+                    if not msg_date:
+                        continue
                     msg = self._extractor.parse(row_el, msg_date)
                     if not msg:
                         continue
@@ -190,25 +232,40 @@ class MessageHarvester:
                     continue
             return added, current_date
 
+        separator_top = None
         for item in self._panel_items(panel):
             try:
                 if (item.get_attribute("data-testid") or "") == "msg-dateseparator":
                     normalized = self._normalize_date(item.text.strip())
                     if normalized:
                         current_date = normalized
+                        separator_top = 0.0
             except StaleElementReferenceException:
                 continue
 
         for row_el in self._ordered_panel_rows(panel):
             try:
+                seen_below_separator = separator_top is not None
                 mid = self._extractor.message_id(row_el)
                 if mid and mid in messages:
-                    msg_date = self._resolve_date(panel, row_el, current_date)
+                    msg_date = self._resolve_date(
+                        panel,
+                        row_el,
+                        current_date,
+                        separator_seen_above=seen_below_separator,
+                    )
                     if msg_date:
                         current_date = msg_date
                     continue
 
-                msg_date = self._resolve_date(panel, row_el, current_date)
+                msg_date = self._resolve_date(
+                    panel,
+                    row_el,
+                    current_date,
+                    separator_seen_above=seen_below_separator,
+                )
+                if not msg_date:
+                    continue
                 msg = self._extractor.parse(row_el, msg_date)
                 if not msg:
                     continue
@@ -253,7 +310,7 @@ class MessageHarvester:
         jitter(0.8, 1.4)
 
         messages: Dict[str, Message] = {}
-        current_date = self._discover_date(panel)
+        current_date = self._ensure_date_context(panel, scroller, "")
         no_new_streak = 0
         stall_streak = 0
         scroll_stuck_streak = 0
@@ -264,6 +321,7 @@ class MessageHarvester:
 
         for step_n in range(1, self.max_top_scrolls + 1):
             scroller.wait_no_spinner()
+            current_date = self._ensure_date_context(panel, scroller, current_date)
 
             try:
                 added, current_date = self.harvest_visible(
@@ -306,6 +364,9 @@ class MessageHarvester:
                 no_new_streak=no_new_streak,
                 prev_oldest_id=prev_oldest_id,
             ):
+                current_date = self._ensure_date_context(
+                    panel, scroller, current_date
+                )
                 self.harvest_visible(panel, messages, current_date)
                 log(
                     f"\n✓  Reached the top of history.  "
@@ -334,6 +395,9 @@ class MessageHarvester:
 
             jitter(self.scroll_pause * 0.35, self.scroll_pause * 0.75)
         else:
+            current_date = self._ensure_date_context(
+                panel, scroller, current_date
+            )
             self.harvest_visible(panel, messages, current_date)
             log(
                 f"\n⚠  Stopped after {self.max_top_scrolls} upward scroll steps.  "

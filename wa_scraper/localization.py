@@ -86,10 +86,10 @@ def is_date_label(raw: str) -> bool:
 
     m = re.match(r"^(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?$", s)
     if m:
-        day, mon = int(m.group(1)), int(m.group(2))
-        if 1 <= day <= 31 and 1 <= mon <= 12:
-            return True
-        return False
+        a, b = int(m.group(1)), int(m.group(2))
+        as_md = 1 <= a <= 12 and 1 <= b <= 31
+        as_dm = 1 <= a <= 31 and 1 <= b <= 12
+        return as_md or as_dm
 
     if re.match(r"^\d{1,2}\s+\S+\s+\d{4}$", s):
         return True
@@ -158,13 +158,41 @@ def normalize_date_impl(raw: str) -> str:
             year = int(m.group(3))
             return f"{day:02d}/{mon:02d}/{year}"
 
+    m = re.match(r"^(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?$", s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        year_raw = m.group(3)
+        if year_raw:
+            year = int(year_raw)
+            if len(year_raw) == 2:
+                year += 2000 if year < 100 else 0
+        else:
+            year = today.year
+
+        parsed: list[date] = []
+        if 1 <= a <= 12 and 1 <= b <= 31:
+            try:
+                parsed.append(date(year, a, b))
+            except ValueError:
+                pass
+        if 1 <= b <= 12 and 1 <= a <= 31 and (b, a) != (a, b):
+            try:
+                parsed.append(date(year, b, a))
+            except ValueError:
+                pass
+        if len(parsed) == 1:
+            return parsed[0].strftime("%d/%m/%Y")
+        if len(parsed) == 2:
+            # WhatsApp Web often renders US-style M/D/Y (e.g. 5/28/2026).
+            return parsed[0].strftime("%d/%m/%Y")
+
     # ── English: explicit date formats ───────────────────────────────────────
     for fmt in (
         "%d %B %Y",   # 15 March 2025
         "%B %d, %Y",  # March 15, 2025
         "%d %b %Y",   # 15 Mar 2025
-        "%d/%m/%Y",   # 15/03/2025
         "%m/%d/%Y",   # 03/15/2025
+        "%d/%m/%Y",   # 15/03/2025
         "%d.%m.%Y",   # 15.03.2025
     ):
         try:

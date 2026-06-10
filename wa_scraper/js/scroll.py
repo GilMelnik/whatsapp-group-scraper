@@ -418,15 +418,28 @@ function _waIsSystemChatNotification(text) {
 function _waLooksLikeNumericDate(text) {
     var m = text.match(/^(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?$/);
     if (!m) return false;
-    var day = parseInt(m[1], 10);
-    var mon = parseInt(m[2], 10);
-    if (day < 1 || day > 31 || mon < 1 || mon > 12) return false;
+    var a = parseInt(m[1], 10);
+    var b = parseInt(m[2], 10);
+    var validMonthDay = function(mon, day) {
+        return mon >= 1 && mon <= 12 && day >= 1 && day <= 31;
+    };
+    if (!validMonthDay(a, b) && !validMonthDay(b, a)) return false;
     if (m[3]) {
         var year = parseInt(m[3], 10);
         if (m[3].length === 2) return year >= 0 && year <= 99;
         return year >= 2000 && year <= 2100;
     }
     return true;
+}
+function _waDateListRowFromNode(node, listRoot) {
+    if (!node || !listRoot) return null;
+    var cur = node;
+    while (cur && cur !== listRoot) {
+        if (cur.parentElement === listRoot) return cur;
+        if (_waMessageRowFromEl(cur)) return null;
+        cur = cur.parentElement;
+    }
+    return null;
 }
 function _waLooksLikeDateLabel(text) {
     text = _waCleanDateText(text);
@@ -615,8 +628,36 @@ function _waDateSeparatorCandidates(panel) {
         addCandidate(child, _waDateLabelFromEl(child));
     }
 
+    var dateSpans = listRoot.querySelectorAll('span[dir="auto"]');
+    for (var ds = 0; ds < dateSpans.length; ds++) {
+        var sp = dateSpans[ds];
+        if (_waIsInsideMessage(sp)) continue;
+        var label = _waElPlainText(sp);
+        if (!_waLooksLikeDateLabel(label)) continue;
+        var wrapper = _waDateListRowFromNode(sp, listRoot);
+        if (wrapper) addCandidate(wrapper, label);
+    }
+
     candidates.sort(function(a, b) { return a.top - b.top; });
     return candidates;
+}
+function _waTopmostVisibleMessageRow(panel) {
+    var panelRect = panel.getBoundingClientRect();
+    var rows = _waQueryMessageRows(panel);
+    var topRow = null;
+    var minTop = Infinity;
+
+    for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        if (!_waIsRealMessageRow(row)) continue;
+        if (!_waVisibleInPanel(row, panelRect)) continue;
+        var top = row.getBoundingClientRect().top;
+        if (top < minTop) {
+            minTop = top;
+            topRow = row;
+        }
+    }
+    return topRow;
 }
 function _waDateForRow(panel, rowEl) {
     var listItem = _waMessageListItem(rowEl);
@@ -762,6 +803,28 @@ _JS_DATE_FOR_ROW = (
 return (function(panel, rowEl) {
     return _waDateForRow(panel, rowEl);
 })(arguments[0], arguments[1]);
+"""
+)
+
+_JS_FIND_DATE_ABOVE = (
+    _JS_SCROLL_HELPERS
+    + _JS_DATE_HELPERS
+    + r"""
+return (function(panel) {
+    return _waFindDateAbove(panel);
+})(arguments[0]);
+"""
+)
+
+_JS_TOPMOST_NEEDS_DATE = (
+    _JS_SCROLL_HELPERS
+    + _JS_DATE_HELPERS
+    + r"""
+return (function(panel) {
+    var row = _waTopmostVisibleMessageRow(panel);
+    if (!row) return false;
+    return !_waDateForRow(panel, row);
+})(arguments[0]);
 """
 )
 
