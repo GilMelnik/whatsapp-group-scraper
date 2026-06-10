@@ -269,7 +269,15 @@ return (function(dialog, targetEmoji) {
     function cleanName(n) {
         n = (n || '').trim();
         n = n.replace(/^~\s*/, '');
+        n = n.replace(/^Maybe\s+/i, '');
+        n = n.replace(
+            /,\s*(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)\s*$/,
+            ''
+        );
         return n.trim();
+    }
+    function normKey(n) {
+        return cleanName(n).toLowerCase().replace(/\s+/g, ' ');
     }
     function phoneFromText(s) {
         var m = (s || '').match(/(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)/);
@@ -277,9 +285,19 @@ return (function(dialog, targetEmoji) {
     }
     function addName(n) {
         n = cleanName(n);
-        if (badName(n) || seen[n]) return;
-        seen[n] = true;
+        if (badName(n)) return;
+        var key = normKey(n);
+        if (seen[key]) return;
+        seen[key] = true;
         names.push(n);
+    }
+    function shouldSkipParticipantRow(el) {
+        if (!el || el.getAttribute('role') !== 'listitem') return false;
+        return !!el.querySelector(
+            '[data-testid="reactions-details-cell-not-me"],'
+            + '[data-testid="reactions-details-cell-me"],'
+            + '[data-testid="react-participant"]'
+        );
     }
     function rowEmoji(el) {
         if (!el) return '';
@@ -308,8 +326,6 @@ return (function(dialog, targetEmoji) {
         var em = rowEmoji(el);
         if (targetEmoji && em && !emojiMatches(em, targetEmoji)) return;
 
-        if (nameFromAriaLabel(el)) return;
-
         var titleEl = el.querySelector(
             '[data-testid="react-participant"] [data-testid="cell-frame-title"] span[title],'
             + '[data-testid="react-participant"] span[title],'
@@ -327,6 +343,8 @@ return (function(dialog, targetEmoji) {
             );
             if (!badName(n)) { addName(n); return; }
         }
+
+        if (nameFromAriaLabel(el)) return;
 
         var secondary = el.querySelector(
             '[data-testid="cell-frame-secondary"],'
@@ -377,6 +395,7 @@ return (function(dialog, targetEmoji) {
             + '[data-testid="cell-frame-container"]'
         );
         for (var i = 0; i < rows.length; i++) {
+            if (shouldSkipParticipantRow(rows[i])) continue;
             nameFromRow(rows[i]);
         }
     }
@@ -476,12 +495,29 @@ return (function(dialog) {
         return false;
     }
     function cleanName(n) {
-        n = (n || '').trim().replace(/^~\s*/, '');
+        n = (n || '').trim();
+        n = n.replace(/^~\s*/, '');
+        n = n.replace(/^Maybe\s+/i, '');
+        n = n.replace(
+            /,\s*(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)\s*$/,
+            ''
+        );
         return n.trim();
+    }
+    function normKey(n) {
+        return cleanName(n).toLowerCase().replace(/\s+/g, ' ');
     }
     function phoneFromText(s) {
         var m = (s || '').match(/(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)/);
         return m ? m[1].trim() : '';
+    }
+    function shouldSkipParticipantRow(el) {
+        if (!el || el.getAttribute('role') !== 'listitem') return false;
+        return !!el.querySelector(
+            '[data-testid="reactions-details-cell-not-me"],'
+            + '[data-testid="reactions-details-cell-me"],'
+            + '[data-testid="react-participant"]'
+        );
     }
     function rowEmoji(el) {
         if (!el) return '';
@@ -502,8 +538,6 @@ return (function(dialog) {
     }
     function nameFromRow(el) {
         if (!el) return '';
-        var fromAria = nameFromAriaLabel(el);
-        if (fromAria && !badName(fromAria)) return fromAria;
         var titleEl = el.querySelector(
             '[data-testid="cell-frame-title"] span[title],'
             + '[data-testid="cell-frame-title"] span[dir],'
@@ -520,6 +554,8 @@ return (function(dialog) {
             );
             if (!badName(n)) return n;
         }
+        var fromAria = nameFromAriaLabel(el);
+        if (fromAria && !badName(fromAria)) return fromAria;
         var phone = phoneFromText(el.innerText || el.textContent || '');
         if (phone) return phone;
         var lines = (el.innerText || el.textContent || '').split('\n');
@@ -535,8 +571,9 @@ return (function(dialog) {
         if (!n || badName(n)) return;
         var key = normEmoji(em) || em;
         if (!grouped[key]) grouped[key] = { emoji: em, senders: [], seen: {} };
-        if (grouped[key].seen[n]) return;
-        grouped[key].seen[n] = true;
+        var nameKey = normKey(n);
+        if (grouped[key].seen[nameKey]) return;
+        grouped[key].seen[nameKey] = true;
         grouped[key].senders.push(n);
     }
     function collect(root) {
@@ -553,6 +590,7 @@ return (function(dialog) {
         );
         for (var i = 0; i < rows.length; i++) {
             var row = rows[i];
+            if (shouldSkipParticipantRow(row)) continue;
             var rowKey = row.innerText || row.textContent || String(i);
             if (seenRows[rowKey]) continue;
             seenRows[rowKey] = true;

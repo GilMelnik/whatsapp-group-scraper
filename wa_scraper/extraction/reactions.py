@@ -35,6 +35,23 @@ from wa_scraper.utils import (
     normalize_emoji,
 )
 
+_PHONE_SUFFIX_RE = re.compile(
+    r",\s*(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)\s*$"
+)
+_MAYBE_PREFIX_RE = re.compile(r"^Maybe\s+", re.I)
+
+
+def _clean_reactor_name(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"^~\s*", "", name)
+    name = _MAYBE_PREFIX_RE.sub("", name)
+    name = _PHONE_SUFFIX_RE.sub("", name).strip()
+    return name.strip()
+
+
+def _reactor_dedup_key(name: str) -> str:
+    return _clean_reactor_name(name).lower()
+
 
 class ReactionExtractor:
     """Extracts emoji reactions and optional reactor names from message rows."""
@@ -159,7 +176,17 @@ class ReactionExtractor:
             names = (
                 self.driver.execute_script(_JS_COLLECT_REACTORS, dialog, emoji) or []
             )
-            cleaned = [str(n).strip() for n in names if str(n).strip()]
+            cleaned: List[str] = []
+            js_seen: set = set()
+            for raw in names:
+                n = _clean_reactor_name(str(raw))
+                if not n:
+                    continue
+                key = _reactor_dedup_key(n)
+                if key in js_seen:
+                    continue
+                js_seen.add(key)
+                cleaned.append(n)
             if cleaned:
                 return cleaned
         except Exception:
@@ -167,6 +194,18 @@ class ReactionExtractor:
 
         senders: List[str] = []
         seen: set = set()
+
+        def add_sender(raw_name: str) -> bool:
+            n = _clean_reactor_name(raw_name)
+            if not n or re.fullmatch(r"\d+", n):
+                return False
+            key = _reactor_dedup_key(n)
+            if key in seen:
+                return False
+            seen.add(key)
+            senders.append(n)
+            return True
+
         try:
             root = self.driver.execute_script(_JS_FIND_REACTIONS_OVERLAY, dialog)
         except Exception:
@@ -189,30 +228,42 @@ class ReactionExtractor:
                     testid = row.get_attribute("data-testid") or ""
                     if role == "tab" or testid == "reactions-tab":
                         continue
+                    if role == "listitem" and find(
+                        row,
+                        (
+                            '[data-testid="reactions-details-cell-not-me"],'
+                            '[data-testid="reactions-details-cell-me"],'
+                            '[data-testid="react-participant"]'
+                        ),
+                    ):
+                        continue
                 except StaleElementReferenceException:
+                    continue
+
+                found_name = False
+                for name_el in find_all(row, S["rxn_name"]):
+                    n = (name_el.get_attribute("title") or name_el.text or "").strip()
+                    if n and add_sender(n):
+                        found_name = True
+                        break
+
+                if found_name:
+                    continue
+
+                if not find_all(row, S["rxn_name"]):
+                    for sp in find_all(row, 'span[title], span[dir="auto"]'):
+                        n = (sp.get_attribute("title") or sp.text or "").strip()
+                        if n and add_sender(n):
+                            found_name = True
+                            break
+
+                if found_name:
                     continue
 
                 aria = (row.get_attribute("aria-label") or "").strip()
                 reacted = re.match(r"^(.+?)\s+reacted\s+with\b", aria, re.I)
                 if reacted:
-                    n = reacted.group(1).strip()
-                    if n and n not in seen and not re.fullmatch(r"\d+", n):
-                        seen.add(n)
-                        senders.append(n)
-                        continue
-
-                for name_el in find_all(row, S["rxn_name"]):
-                    n = (name_el.get_attribute("title") or name_el.text or "").strip()
-                    if n and n not in seen and not re.fullmatch(r"\d+", n):
-                        seen.add(n)
-                        senders.append(n)
-
-                if not find_all(row, S["rxn_name"]):
-                    for sp in find_all(row, 'span[title], span[dir="auto"]'):
-                        n = (sp.get_attribute("title") or sp.text or "").strip()
-                        if n and n not in seen and not re.fullmatch(r"\d+", n):
-                            seen.add(n)
-                            senders.append(n)
+                    add_sender(reacted.group(1).strip())
 
             try:
                 prev = self.driver.execute_script(
