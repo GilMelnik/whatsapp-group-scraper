@@ -15,6 +15,7 @@ from wa_scraper.js.scroll import (
     _JS_CHAT_ITEMS,
     _JS_DATE_FOR_ROW,
     _JS_DISCOVER_DATE,
+    _JS_TOPMOST_NEEDS_DATE,
 )
 from wa_scraper.localization import is_date_label, normalize_date_impl
 from wa_scraper.models import Message
@@ -62,7 +63,7 @@ class MessageHarvester:
 
     def _discover_date(self, panel) -> str:
         try:
-            raw = self.driver.execute_script(_JS_DISCOVER_DATE, panel, 8)
+            raw = self.driver.execute_script(_JS_DISCOVER_DATE, panel, 48)
             if isinstance(raw, str) and raw.strip():
                 return self._normalize_date(raw)
         except Exception:
@@ -78,25 +79,22 @@ class MessageHarvester:
             pass
         return ""
 
-    def _resolve_date(self, panel, row_el, current_date: str) -> str:
+    def _resolve_message_date(self, panel, row_el, walk_date: str) -> str:
+        """Resolve a message date from DOM separators only — never stale carry-over."""
         row_date = self._date_for_row(panel, row_el)
         if row_date:
             return row_date
+        if walk_date:
+            return walk_date
+        return ""
 
-        if current_date:
-            return current_date
-
-        discovered = self._discover_date(panel)
-        if discovered:
-            return discovered
-
-        if not self._date_fallback_warned:
-            log(
-                "  ⚠  No in-chat date separator found yet;"
-                " using today until one appears."
+    def _topmost_visible_needs_date(self, panel) -> bool:
+        try:
+            return bool(
+                self.driver.execute_script(_JS_TOPMOST_NEEDS_DATE, panel)
             )
-            self._date_fallback_warned = True
-        return date.today().strftime("%d/%m/%Y")
+        except Exception:
+            return False
 
     def _ordered_panel_rows(self, panel) -> List:
         rows: List = []
