@@ -1,14 +1,35 @@
 """JavaScript snippets for chat panel scrolling."""
 
 _JS_SCROLL_HELPERS = r"""
+function _waMsgRowSelector() {
+    return (
+        'div.focusable-list-item[data-id], ' +
+        '[data-testid^="conv-msg-"][data-id], ' +
+        'div.xscbp6u[data-id], ' +
+        '[data-testid="msg-container"]'
+    );
+}
+function _waQueryMessageRows(root) {
+    return root.querySelectorAll(_waMsgRowSelector());
+}
+function _waRowIdFromEl(el) {
+    if (!el) return '';
+    var id = el.getAttribute('data-id');
+    if (id) return id;
+    var listItem = el.closest('div.focusable-list-item[data-id]');
+    if (listItem) return listItem.getAttribute('data-id') || '';
+    var conv = el.closest('[data-testid^="conv-msg-"][data-id]')
+        || el.closest('div.xscbp6u[data-id]');
+    if (conv) return conv.getAttribute('data-id') || '';
+    var inner = el.querySelector('[data-id]');
+    return inner ? (inner.getAttribute('data-id') || '') : '';
+}
 function _waFindScrollEl(panel) {
     function score(el) {
         if (!el || el.scrollHeight <= el.clientHeight + 2) return -1;
         var oy = window.getComputedStyle(el).overflowY;
         if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return -1;
-        var rows = el.querySelectorAll(
-            'div.focusable-list-item[data-id], [data-testid="msg-container"]'
-        ).length;
+        var rows = _waQueryMessageRows(el).length;
         return rows * 10000 + el.scrollHeight;
     }
     var best = panel;
@@ -17,6 +38,11 @@ function _waFindScrollEl(panel) {
     if (pref) {
         var ps = score(pref);
         if (ps > bestScore) { bestScore = ps; best = pref; }
+    }
+    var tabPanel = panel.querySelector('div[tabindex="0"][data-tab]');
+    if (tabPanel) {
+        var ts = score(tabPanel);
+        if (ts > bestScore) { bestScore = ts; best = tabPanel; }
     }
     var nodes = panel.querySelectorAll(
         '[role="application"], [data-scrolltraceid], div'
@@ -34,14 +60,19 @@ function _waFindScrollEl(panel) {
     return best;
 }
 function _waTopmostRow(panel) {
-    var rows = panel.querySelectorAll('div.focusable-list-item[data-id]');
+    var panelRect = panel.getBoundingClientRect();
+    var rows = _waQueryMessageRows(panel);
     var topRow = null;
     var minY = Infinity;
     for (var i = 0; i < rows.length; i++) {
-        var rect = rows[i].getBoundingClientRect();
+        var el = rows[i];
+        if (!_waIsRealMessageRow(el)) continue;
+        var rect = el.getBoundingClientRect();
+        if (rect.bottom <= panelRect.top + 1) continue;
+        if (rect.top >= panelRect.bottom - 1) continue;
         if (rect.top < minY) {
             minY = rect.top;
-            topRow = rows[i];
+            topRow = el;
         }
     }
     return topRow;
@@ -57,48 +88,97 @@ function _waDispatchWheel(scrollEl, deltaY) {
         }));
     } catch (e) {}
 }
-function _waIsReversed(el) {
-    function hasReverse(node) {
-        try {
-            var fd = window.getComputedStyle(node).flexDirection || '';
-            if (fd.indexOf('reverse') >= 0) return true;
-        } catch (e) {}
-        return false;
+function _waHasReverseFlex(node) {
+    try {
+        var fd = window.getComputedStyle(node).flexDirection || '';
+        return fd.indexOf('reverse') >= 0;
+    } catch (e) {}
+    return false;
+}
+function _waDetectReversedOnce(panel, scrollEl) {
+    if (panel.dataset.waReversed === '1') return true;
+    if (panel.dataset.waReversed === '0') return false;
+
+    var reversed = false;
+    if (_waHasReverseFlex(scrollEl)) reversed = true;
+    if (!reversed) {
+        var kids = scrollEl.querySelectorAll(
+            '[role="row"], [data-testid^="conv-msg-"], ' +
+            '[data-testid="msg-container"], div.focusable-list-item'
+        );
+        for (var i = 0; i < kids.length && i < 24; i++) {
+            if (_waHasReverseFlex(kids[i])) {
+                reversed = true;
+                break;
+            }
+        }
     }
-    if (hasReverse(el)) return true;
-    var kids = el.querySelectorAll(
-        '[role="row"], [data-testid="msg-container"], div.focusable-list-item'
-    );
-    for (var i = 0; i < kids.length && i < 16; i++) {
-        if (hasReverse(kids[i])) return true;
-    }
-    // Fresh chats open at the newest messages with raw scrollTop ~= 0.
-    if (el.scrollTop >= -2 && el.scrollTop <= 2) {
-        var rows = el.querySelectorAll('div.focusable-list-item[data-id]');
+    // Only use scroll position on first detection while still at the bottom.
+    if (!reversed && scrollEl.scrollTop >= -2 && scrollEl.scrollTop <= 2) {
+        var rows = _waQueryMessageRows(scrollEl);
         if (rows.length > 0) {
             var last = rows[rows.length - 1];
             var rect = last.getBoundingClientRect();
-            var er = el.getBoundingClientRect();
-            if (rect.bottom >= er.bottom - 40) return true;
+            var er = scrollEl.getBoundingClientRect();
+            if (rect.bottom >= er.bottom - 40) reversed = true;
         }
     }
+    panel.dataset.waReversed = reversed ? '1' : '0';
+    return reversed;
+}
+function _waIsReversed(el) {
     return false;
+}
+function _waMaxScroll(el) {
+    return Math.max(0, el.scrollHeight - el.clientHeight);
 }
 function _waLogicalTop(el, reversed) {
     if (reversed) {
-        return el.scrollTop + el.scrollHeight - el.clientHeight;
+        return _waMaxScroll(el) - el.scrollTop;
     }
     return el.scrollTop;
 }
 function _waSetLogicalTop(el, reversed, logical) {
     if (reversed) {
-        el.scrollTop = logical - el.scrollHeight + el.clientHeight;
+        var maxScroll = _waMaxScroll(el);
+        el.scrollTop = Math.max(0, Math.min(maxScroll, maxScroll - logical));
     } else {
-        el.scrollTop = logical;
+        el.scrollTop = Math.max(0, Math.min(_waMaxScroll(el), logical));
     }
 }
+function _waScrollPhysical(el, reversed, delta) {
+    var maxScroll = _waMaxScroll(el);
+    if (reversed) {
+        el.scrollTop = Math.max(0, Math.min(maxScroll, el.scrollTop + delta));
+    } else {
+        el.scrollTop = Math.max(0, Math.min(maxScroll, el.scrollTop - delta));
+    }
+}
+function _waIsNotificationRow(el) {
+    if (!el) return false;
+    var row = el.closest('[role="row"]') || el;
+    if (row.querySelector(
+        '[data-testid="msg-notification-container"], ' +
+        '[data-testid="subtype-invite"], ' +
+        '[data-testid="subtype-add"], ' +
+        '[data-testid="system_message"]'
+    )) {
+        return true;
+    }
+    var container = row.querySelector('[data-testid="msg-container"]') || row;
+    if (container.getAttribute('data-testid') === 'msg-notification-container') {
+        return true;
+    }
+    return !container.querySelector('[data-testid="msg-meta"]')
+        && !container.querySelector('[data-testid="tail-out"], [data-testid="tail-in"]');
+}
+function _waIsRealMessageRow(el) {
+    if (!el || _waIsNotificationRow(el)) return false;
+    var container = el.querySelector('[data-testid="msg-container"]') || el;
+    return container.getAttribute('data-testid') !== 'msg-notification-container';
+}
 function _waMaxLogical(el) {
-    return Math.max(0, el.scrollHeight - el.clientHeight);
+    return _waMaxScroll(el);
 }
 function _waAtTop(el, reversed) {
     return _waLogicalTop(el, reversed) <= 2;
@@ -113,27 +193,27 @@ _JS_PANEL_METRICS = (
     + r"""
 return (function(panel) {
     var scrollEl = _waFindScrollEl(panel);
-    var reversed = _waIsReversed(scrollEl);
+    var reversed = _waDetectReversedOnce(panel, scrollEl);
     var panelRect = panel.getBoundingClientRect();
-    var rows = panel.querySelectorAll('div.focusable-list-item[data-id], [data-testid="msg-container"]');
+    var rows = _waQueryMessageRows(panel);
     var visible = [];
     var maxBottom = -Infinity;
     var minTop = Infinity;
     var anchorBottom = null;
     var oldestId = '';
     var oldestTop = Infinity;
+    var seenIds = {};
 
     for (var i = 0; i < rows.length; i++) {
         var el = rows[i];
+        if (!_waIsRealMessageRow(el)) continue;
         var rect = el.getBoundingClientRect();
         if (rect.bottom <= panelRect.top + 1) continue;
         if (rect.top >= panelRect.bottom - 1) continue;
 
-        var dataId = el.getAttribute('data-id') || '';
-        if (!dataId) {
-            var inner = el.querySelector('[data-id]');
-            if (inner) dataId = inner.getAttribute('data-id') || '';
-        }
+        var dataId = _waRowIdFromEl(el);
+        if (!dataId || seenIds[dataId]) continue;
+        seenIds[dataId] = true;
         var relTop = rect.top - panelRect.top;
         var relBottom = rect.bottom - panelRect.top;
         visible.push({
@@ -179,9 +259,9 @@ return (function(panel, direction, overlap) {
     overlap = overlap || 28;
     direction = direction || 'down';
     var scrollEl = _waFindScrollEl(panel);
-    var reversed = _waIsReversed(scrollEl);
+    var reversed = _waDetectReversedOnce(panel, scrollEl);
     var panelRect = panel.getBoundingClientRect();
-    var rows = panel.querySelectorAll('div.focusable-list-item[data-id], [data-testid="msg-container"]');
+    var rows = _waQueryMessageRows(panel);
     var prevLogical = _waLogicalTop(scrollEl, reversed);
     var prevRaw = scrollEl.scrollTop;
     var delta = 0;
@@ -211,17 +291,8 @@ return (function(panel, direction, overlap) {
             var offset = Math.max(0, tRect.top - sRect.top - 12);
             delta = Math.max(delta, offset + 180);
         }
-        if (topRow) {
-            try {
-                topRow.scrollIntoView({block: 'start', inline: 'nearest'});
-            } catch (e) {}
-        }
-        var targets = [scrollEl];
-        if (panel !== scrollEl) targets.push(panel);
-        for (var ti = 0; ti < targets.length; ti++) {
-            targets[ti].scrollTop -= delta;
-            _waDispatchWheel(targets[ti], -delta);
-        }
+        _waSetLogicalTop(scrollEl, reversed, Math.max(0, prevLogical - delta));
+        _waDispatchWheel(scrollEl, reversed ? delta : -delta);
     }
 
     var logicalTop = _waLogicalTop(scrollEl, reversed);
@@ -235,6 +306,82 @@ return (function(panel, direction, overlap) {
         atTop: _waAtTop(scrollEl, reversed),
         stuck: Math.abs(logicalTop - prevLogical) < 1
             && Math.abs(scrollEl.scrollTop - prevRaw) < 1
+    };
+})(arguments[0], arguments[1], arguments[2]);
+"""
+)
+
+_JS_PANEL_SCROLL_UP = (
+    _JS_SCROLL_HELPERS
+    + r"""
+return (function(panel, anchorId, overlap) {
+    overlap = overlap || 32;
+    var scrollEl = _waFindScrollEl(panel);
+    var reversed = _waDetectReversedOnce(panel, scrollEl);
+    var prevRaw = scrollEl.scrollTop;
+    var prevLogical = _waLogicalTop(scrollEl, reversed);
+    var stepSize = 64;
+    var topRow = _waTopmostRow(panel);
+    var anchorRow = null;
+
+    if (anchorId) {
+        anchorRow = panel.querySelector('[data-id="' + anchorId + '"]');
+        if (!anchorRow) {
+            anchorRow = panel.querySelector(
+                '[data-testid="conv-msg-' + anchorId + '"]'
+            );
+        }
+        if (!anchorRow) {
+            anchorRow = panel.querySelector(
+                'div.xscbp6u[data-id="' + anchorId + '"]'
+            );
+        }
+    }
+
+    var scrollRow = anchorRow || topRow;
+    if (scrollRow) {
+        var tRect = scrollRow.getBoundingClientRect();
+        var rowHeight = Math.max(tRect.height, 28);
+        stepSize = Math.max(
+            24,
+            Math.min(
+                140,
+                Math.floor(rowHeight * (0.42 + Math.random() * 0.22)) + overlap
+            )
+        );
+    } else {
+        stepSize = Math.max(
+            36,
+            Math.floor(scrollEl.clientHeight * (0.12 + Math.random() * 0.1))
+        );
+    }
+
+    var delta = stepSize;
+    _waSetLogicalTop(scrollEl, reversed, Math.max(0, prevLogical - delta));
+
+    var targets = [scrollEl];
+    if (panel !== scrollEl) targets.push(panel);
+    var wheelSign = reversed ? 1 : -1;
+    var remaining = delta;
+    while (remaining > 0) {
+        var chunk = Math.min(remaining, 14 + Math.floor(Math.random() * 26));
+        for (var t = 0; t < targets.length; t++) {
+            _waDispatchWheel(targets[t], wheelSign * chunk);
+        }
+        remaining -= chunk;
+    }
+
+    var logicalTop = _waLogicalTop(scrollEl, reversed);
+    var moved = Math.abs(logicalTop - prevLogical) >= 1
+        || Math.abs(scrollEl.scrollTop - prevRaw) >= 1;
+    return {
+        scrolled: logicalTop - prevLogical,
+        delta: delta,
+        scrollTop: logicalTop,
+        rawScrollTop: scrollEl.scrollTop,
+        anchorFound: !!anchorRow,
+        reversed: reversed,
+        stuck: !moved
     };
 })(arguments[0], arguments[1], arguments[2]);
 """
@@ -341,23 +488,45 @@ function _waHasFixedAncestor(el, panel) {
     }
     return false;
 }
+function _waMessageListItem(rowEl) {
+    if (!rowEl) return rowEl;
+    var conv = rowEl.closest('[data-testid^="conv-msg-"][data-id]');
+    if (conv) return conv;
+    var scbp = rowEl.closest('div.xscbp6u[data-id]');
+    if (scbp) return scbp;
+    var focusable = rowEl.closest('div.focusable-list-item[data-id]');
+    if (focusable) return focusable;
+    return rowEl;
+}
 function _waIsInsideMessage(el) {
     return !!el.closest(
-        'div.focusable-list-item[data-id], [data-testid="msg-container"], [data-testid="msg-meta"]'
+        'div.focusable-list-item[data-id], ' +
+        '[data-testid^="conv-msg-"][data-id], ' +
+        '[data-testid="msg-container"], [data-testid="msg-meta"]'
     );
 }
 function _waMessageRowFromEl(el) {
     if (!el || el.nodeType !== 1) return null;
     if (el.getAttribute('data-testid') === 'msg-container') return el;
+    var testid = el.getAttribute('data-testid') || '';
+    if (testid.indexOf('conv-msg-') === 0 && el.getAttribute('data-id')) return el;
     if (el.classList.contains('focusable-list-item') && el.getAttribute('data-id')) return el;
+    if (el.classList.contains('xscbp6u') && el.getAttribute('data-id')) return el;
 
     var nested = el.querySelector('[data-testid="msg-container"]')
+        || el.querySelector('[data-testid^="conv-msg-"][data-id]')
+        || el.querySelector('div.xscbp6u[data-id]')
         || el.querySelector('div.focusable-list-item[data-id]');
-    return nested || null;
+    if (nested) return nested;
+    var conv = el.closest('[data-testid^="conv-msg-"][data-id]')
+        || el.closest('div.xscbp6u[data-id]');
+    if (conv) return conv;
+    return null;
 }
 function _waFindMessageList(panel) {
     var scrollEl = _waFindScrollEl(panel);
-    var sample = panel.querySelector('div.focusable-list-item[data-id]');
+    var rows = _waQueryMessageRows(panel);
+    var sample = rows.length ? rows[0] : null;
     if (!sample) return scrollEl;
 
     var best = scrollEl;
@@ -402,7 +571,7 @@ function _waDateSeparatorCandidates(panel) {
         if (!text || !el || !_waLooksLikeDateLabel(text)) return;
         if (_waIsInsideMessage(el)) return;
         if (_waHasFixedAncestor(el, panel)) return;
-        if (el.querySelector('div.focusable-list-item[data-id], [data-testid="msg-container"]')) {
+        if (el.querySelector(_waMsgRowSelector())) {
             return;
         }
 
@@ -424,11 +593,18 @@ function _waDateSeparatorCandidates(panel) {
     var tabDivs = panel.querySelectorAll('div[tabindex="-1"]');
     for (var t = 0; t < tabDivs.length; t++) {
         var tab = tabDivs[t];
-        if (tab.querySelector('div.focusable-list-item[data-id], [data-testid="msg-container"]')) {
+        if (tab.querySelector(_waMsgRowSelector())) {
             continue;
         }
         if (tab.querySelector('a[href]')) continue;
         addCandidate(tab, _waDateLabelFromEl(tab));
+    }
+
+    var roleRows = panel.querySelectorAll('[role="row"]');
+    for (var rr = 0; rr < roleRows.length; rr++) {
+        var roleRow = roleRows[rr];
+        if (roleRow.querySelector(_waMsgRowSelector())) continue;
+        addCandidate(roleRow, _waDateLabelFromEl(roleRow));
     }
 
     var listRoot = _waFindMessageList(panel);
@@ -443,7 +619,7 @@ function _waDateSeparatorCandidates(panel) {
     return candidates;
 }
 function _waDateForRow(panel, rowEl) {
-    var listItem = rowEl.closest('div.focusable-list-item[data-id]') || rowEl;
+    var listItem = _waMessageListItem(rowEl);
     var rowTop = listItem.getBoundingClientRect().top;
     var candidates = _waDateSeparatorCandidates(panel);
     var best = '';
@@ -459,33 +635,29 @@ function _waDateForRow(panel, rowEl) {
     return best;
 }
 function _waRowTop(row, panelRect) {
-    var listItem = row.closest('div.focusable-list-item[data-id]') || row;
-    return listItem.getBoundingClientRect().top;
+    return _waMessageListItem(row).getBoundingClientRect().top;
 }
 function _waRowKey(row) {
-    var listItem = row.closest('div.focusable-list-item[data-id]');
-    if (listItem) {
-        return listItem.getAttribute('data-id') || '';
-    }
-    return row.getAttribute('data-id') || '';
+    return _waRowIdFromEl(row);
 }
 function _waVisibleMessageRows(panel) {
     var panelRect = panel.getBoundingClientRect();
-    var rows = panel.querySelectorAll(
-        'div.focusable-list-item[data-id], [data-testid="msg-container"]'
-    );
+    var rows = _waQueryMessageRows(panel);
     var seen = {};
     var items = [];
 
     for (var i = 0; i < rows.length; i++) {
         var row = rows[i];
+        if (!_waIsRealMessageRow(row)) continue;
         if (!_waVisibleInPanel(row, panelRect)) continue;
 
         var key = _waRowKey(row);
         if (!key || seen[key]) continue;
         seen[key] = true;
 
-        var listItem = row.closest('div.focusable-list-item[data-id]');
+        var listItem = row.closest('div.xscbp6u[data-id]')
+            || row.closest('[data-testid^="conv-msg-"][data-id]')
+            || row.closest('div.focusable-list-item[data-id]');
         var el = listItem || row;
         items.push({
             kind: 'message',
@@ -515,8 +687,9 @@ function _waFindDateAbove(panel) {
     var candidates = _waDateSeparatorCandidates(panel);
     var firstMsgTop = Infinity;
 
-    var rows = panel.querySelectorAll('div.focusable-list-item[data-id]');
+    var rows = _waQueryMessageRows(panel);
     for (var i = 0; i < rows.length; i++) {
+        if (!_waIsRealMessageRow(rows[i])) continue;
         if (!_waVisibleInPanel(rows[i], panelRect)) continue;
         var top = rows[i].getBoundingClientRect().top;
         if (top < firstMsgTop) firstMsgTop = top;
@@ -554,20 +727,26 @@ _JS_DISCOVER_DATE = (
 return (function(panel, maxAttempts) {
     maxAttempts = maxAttempts || 8;
     var scrollEl = _waFindScrollEl(panel);
-    var reversed = _waIsReversed(scrollEl);
+    var reversed = _waDetectReversedOnce(panel, scrollEl);
 
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
         var text = _waFindDateAbove(panel);
         if (text) return text;
 
-        if (_waAtTop(scrollEl, reversed)) break;
+        var prevLogical = _waLogicalTop(scrollEl, reversed);
+        var delta = 96 + Math.floor(Math.random() * 64);
+        _waSetLogicalTop(scrollEl, reversed, Math.max(0, prevLogical - delta));
 
-        var delta = 180;
         var targets = [scrollEl];
         if (panel !== scrollEl) targets.push(panel);
-        for (var i = 0; i < targets.length; i++) {
-            targets[i].scrollTop -= delta;
-            _waDispatchWheel(targets[i], -delta);
+        var wheelSign = reversed ? 1 : -1;
+        var remaining = delta;
+        while (remaining > 0) {
+            var chunk = Math.min(remaining, 12 + Math.floor(Math.random() * 20));
+            for (var i = 0; i < targets.length; i++) {
+                _waDispatchWheel(targets[i], wheelSign * chunk);
+            }
+            remaining -= chunk;
         }
     }
 

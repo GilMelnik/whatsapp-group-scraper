@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Dict, List, Tuple
 
 from selenium.common.exceptions import StaleElementReferenceException
@@ -31,12 +31,10 @@ class MessageHarvester:
         driver,
         scroll_pause: float = 1.0,
         max_top_scrolls: int = 6000,
-        max_down_passes: int = 10,
     ) -> None:
         self.driver = driver
         self.scroll_pause = scroll_pause
         self.max_top_scrolls = max_top_scrolls
-        self.max_down_passes = max_down_passes
         self._extractor = MessageExtractor(driver)
         self._date_fallback_warned = False
         self._dates_logged = False
@@ -110,7 +108,11 @@ class MessageHarvester:
                 if testid == "msg-container":
                     row_el = item
                 elif item.get_attribute("data-id"):
-                    row_el = find(item, S["message_row"]) or item
+                    classes = item.get_attribute("class") or ""
+                    if testid.startswith("conv-msg-") or "xscbp6u" in classes:
+                        row_el = item
+                    else:
+                        row_el = find(item, S["message_row"]) or item
                 else:
                     continue
 
@@ -167,6 +169,13 @@ class MessageHarvester:
                     if not row_el:
                         continue
 
+                    mid = self._extractor.message_id(row_el)
+                    if mid and mid in messages:
+                        msg_date = self._resolve_date(panel, row_el, current_date)
+                        if msg_date:
+                            current_date = msg_date
+                        continue
+
                     msg_date = self._resolve_date(panel, row_el, current_date)
                     msg = self._extractor.parse(row_el, msg_date)
                     if not msg:
@@ -194,6 +203,13 @@ class MessageHarvester:
 
         for row_el in self._ordered_panel_rows(panel):
             try:
+                mid = self._extractor.message_id(row_el)
+                if mid and mid in messages:
+                    msg_date = self._resolve_date(panel, row_el, current_date)
+                    if msg_date:
+                        current_date = msg_date
+                    continue
+
                 msg_date = self._resolve_date(panel, row_el, current_date)
                 msg = self._extractor.parse(row_el, msg_date)
                 if not msg:
@@ -210,55 +226,46 @@ class MessageHarvester:
 
         return added, current_date
 
+    def _sort_messages(self, messages: Dict[str, Message]) -> List[Message]:
+        def sort_key(msg: Message):
+            for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
+                try:
+                    ts = datetime.strptime(f"{msg.date} {msg.time}", fmt).timestamp()
+                    return (0, ts, msg.id)
+                except ValueError:
+                    continue
+            return (1, 0.0, msg.id)
+
+        return sorted(messages.values(), key=sort_key)
+
     def scrape(self) -> List[Message]:
         panel = WebDriverWait(self.driver, 30).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, S["panel"]))
         )
         scroller = PanelScroller(self.driver, panel)
 
-        log("↑  Rewinding to the start of history …")
-        rewind_metrics = scroller.scroll_to_top(
-            self.scroll_pause, self.max_top_scrolls
-        )
-        rewind_ok = PanelScroller.rewind_near_top(rewind_metrics)
-        if not rewind_ok:
-            log(
-                "  ⚠  Rewind did not reach the top — will keep scrolling up"
-                " while harvesting."
+        try:
+            self.driver.execute_script(
+                "delete arguments[0].dataset.waReversed;", panel
             )
+        except Exception:
+            pass
 
-        log("↓  Reading messages and collecting reactors …")
+        log("↑  Harvesting from newest messages upward …")
         jitter(0.8, 1.4)
 
         messages: Dict[str, Message] = {}
         current_date = self._discover_date(panel)
         no_new_streak = 0
-        step_n = 0
         stall_streak = 0
+        scroll_stuck_streak = 0
+        prev_oldest_id = ""
+        anchor_id: str | None = None
         prev_message_count = 0
+        stagnant_steps = 0
 
-        while step_n < self.max_down_passes:
-            step_n += 1
+        for step_n in range(1, self.max_top_scrolls + 1):
             scroller.wait_no_spinner()
-            added = 0
-
-            if not rewind_ok:
-                up_metrics = scroller.metrics()
-                for _ in range(8):
-                    scroller.wait_no_spinner()
-                    up_result = scroller.scroll("up")
-                    if up_result.get("stuck"):
-                        scroller.scroll_fallback("up")
-                    up_metrics = scroller.metrics()
-                    if PanelScroller.rewind_near_top(up_metrics):
-                        rewind_ok = True
-                        break
-                    jitter(self.scroll_pause * 0.1, self.scroll_pause * 0.2)
-                if step_n == 1 or step_n % 10 == 0 or rewind_ok:
-                    log(
-                        "  ↑  loading history"
-                        f" (logicalTop={up_metrics.get('scrollTop', 0)}) …"
-                    )
 
             try:
                 added, current_date = self.harvest_visible(
@@ -276,63 +283,63 @@ class MessageHarvester:
             else:
                 no_new_streak += 1
 
+            if len(messages) == prev_message_count:
+                stagnant_steps += 1
+            else:
+                stagnant_steps = 0
+            prev_message_count = len(messages)
+
             metrics = scroller.metrics()
-            scroll_top = metrics.get("scrollTop", 0)
             visible_n = metrics.get("visibleCount", 0)
-            at_bottom = metrics.get("atBottom", False)
+            oldest_id = metrics.get("oldestId") or ""
+            anchor_id = scroller.topmost_anchor_id(messages, metrics)
 
             if step_n == 1 or step_n % 15 == 0 or added:
+                anchor_hint = f", anchor={anchor_id[:12]}…" if anchor_id else ""
                 log(
-                    f"  ↓ step {step_n}: {len(messages)} total"
-                    f" (+{added} new), visible={visible_n}, scrollTop={scroll_top}"
+                    f"  ↑ step {step_n}: {len(messages)} total"
+                    f" (+{added} new), visible={visible_n}{anchor_hint}"
                 )
 
-            if at_bottom and no_new_streak >= 5 and rewind_ok:
-                self.harvest_visible(panel, messages, current_date)
-                log(f"\n✓  End of chat reached.  {len(messages)} messages captured.")
-                break
-
-            if not rewind_ok:
-                no_new_streak = 0
-                stall_streak = 0
-                continue
-
-            scroll_result = scroller.scroll("down")
-            if scroll_result.get("stuck"):
-                stall_streak += 1
-                scroller.scroll_fallback("down")
-            else:
-                stall_streak = 0
-
-            if stall_streak >= 8 and no_new_streak >= 5:
-                log(
-                    f"\n✓  Scroll stalled near end.  {len(messages)} messages captured."
-                )
-                break
-
-            if (
-                no_new_streak >= 12
-                and at_bottom
-                and len(messages) == prev_message_count
-                and step_n > 6
+            if PanelScroller.reached_history_top(
+                metrics,
+                stall_streak=stall_streak,
+                scroll_stuck_streak=scroll_stuck_streak,
+                no_new_streak=no_new_streak,
+                prev_oldest_id=prev_oldest_id,
             ):
+                self.harvest_visible(panel, messages, current_date)
                 log(
-                    f"\n✓  No new messages near bottom.  "
+                    f"\n✓  Reached the top of history.  "
                     f"{len(messages)} messages captured."
                 )
                 break
 
-            prev_message_count = len(messages)
-            jitter(self.scroll_pause * 0.35, self.scroll_pause * 0.75)
+            scroll_result = scroller.scroll_up_from_anchor(anchor_id)
+            scrolled = scroll_result.get("scrolled") or 0
+            if scroll_result.get("stuck") or scrolled > 1:
+                scroll_stuck_streak += 1
+                scroller.scroll_fallback("up")
+            else:
+                scroll_stuck_streak = 0
 
+            if stagnant_steps >= 12 and scroll_stuck_streak < 3:
+                scroller.scroll_chunk(-(140 + (stagnant_steps % 5) * 24))
+
+            metrics = scroller.metrics()
+            oldest_id = metrics.get("oldestId") or oldest_id
+            if oldest_id and oldest_id == prev_oldest_id:
+                stall_streak += 1
+            else:
+                stall_streak = 0
+            prev_oldest_id = oldest_id
+
+            jitter(self.scroll_pause * 0.35, self.scroll_pause * 0.75)
         else:
+            self.harvest_visible(panel, messages, current_date)
             log(
-                f"\n⚠  Stopped after {self.max_down_passes} down-scroll steps.  "
+                f"\n⚠  Stopped after {self.max_top_scrolls} upward scroll steps.  "
                 f"{len(messages)} messages captured."
             )
 
-        added, current_date = self.harvest_visible(panel, messages, current_date)
-        if added:
-            log(f"  Final viewport harvest: +{added} messages")
-
-        return list(messages.values())
+        return self._sort_messages(messages)

@@ -62,6 +62,27 @@ class MessageExtractor:
         except (NoSuchElementException, StaleElementReferenceException):
             return row_el
 
+    def is_notification_row(self, row_el) -> bool:
+        if find(
+            row_el,
+            (
+                '[data-testid="msg-notification-container"], '
+                '[data-testid="subtype-invite"], '
+                '[data-testid="subtype-add"], '
+                '[data-testid="system_message"]'
+            ),
+        ):
+            return True
+        container = find(row_el, '[data-testid="msg-container"]') or row_el
+        try:
+            if (container.get_attribute("data-testid") or "") == "msg-notification-container":
+                return True
+        except StaleElementReferenceException:
+            return True
+        return not find(container, S["msg_meta"]) and not find(
+            row_el, f'{S["tail_out"]}, {S["tail_in"]}'
+        )
+
     def is_outgoing(self, row_el) -> bool:
         mid = self.message_id(row_el)
         if mid.startswith("true_"):
@@ -213,6 +234,9 @@ class MessageExtractor:
             if not mid:
                 return None
 
+            if self.is_notification_row(row_el):
+                return None
+
             dom = self.parse_dom(row_el)
 
             is_out = (
@@ -255,6 +279,11 @@ class MessageExtractor:
                 and not sender.phone
                 and not text
                 and media_type is None
+            ):
+                return None
+
+            if media_type is None and not re.search(
+                r"\d{1,2}:\d{2}", msg_time
             ):
                 return None
 

@@ -138,6 +138,8 @@ MEDIA_CHECKS: List[tuple] = [
 # Date separators plus every row shape WhatsApp uses in the virtual list.
 CHAT_ITEM_SELECTOR = (
     f'{S["date_card"]}, {S["message_row"]}, '
+    '[data-testid^="conv-msg-"][data-id], '
+    'div.xscbp6u[data-id], '
     'div.focusable-list-item[data-id]'
 )
 

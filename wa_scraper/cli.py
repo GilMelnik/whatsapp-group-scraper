@@ -76,7 +76,8 @@ Notes
   • WhatsApp Web uses a virtual list – rows outside the viewport are removed
     from the DOM, so messages are harvested progressively as you scroll.
   • Reactor names are collected by opening the reactions drawer.
-  • Scrolling uses visible message row heights so the harvest pass does not skip rows.
+  • Scrolling harvests from the newest messages upward, anchored on the last
+    scraped row so rows are not skipped.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -112,13 +113,7 @@ def main() -> None:
         "--max-top-scrolls",
         type=int,
         default=6000,
-        help="Max upward scroll attempts when rewinding to top (default: 6000).",
-    )
-    ap.add_argument(
-        "--max-down-passes",
-        type=int,
-        default=3,
-        help="Max downward scroll passes when reading messages (default: 3).",
+        help="Max upward scroll steps while harvesting history (default: 6000).",
     )
     args = ap.parse_args()
 
@@ -133,7 +128,6 @@ def main() -> None:
         profile_dir=args.profile_dir,
         scroll_pause=args.scroll_pause,
         max_top_scrolls=args.max_top_scrolls,
-        max_down_passes=args.max_down_passes,
     )
 
     scraper = WhatsAppScraper(config)

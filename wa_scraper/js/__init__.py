@@ -25,5 +25,6 @@ from wa_scraper.js.scroll import (
     _JS_DISCOVER_DATE,
     _JS_PANEL_METRICS,
     _JS_PANEL_SCROLL,
+    _JS_PANEL_SCROLL_UP,
     _JS_SCROLL_HELPERS,
 )
