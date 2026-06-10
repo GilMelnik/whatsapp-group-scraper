@@ -661,24 +661,23 @@ return (function(dialog) {
     }
     function rowEmoji(el) {
         if (!el) return '';
+        var ariaLabel = (el.getAttribute('aria-label') || '').trim();
+        var ariaMatch = ariaLabel.match(/\breacted\s+with\s+(.+)$/i);
+        if (ariaMatch) {
+            var fromAria = firstEmoji(ariaMatch[1]) || ariaMatch[1].trim();
+            if (fromAria) return fromAria;
+        }
         var reactionImgs = el.querySelectorAll(
             '[data-testid="reaction-bubble-item"] img[alt],'
             + '[data-testid="reactions-list-item"] img[alt],'
-            + 'img.emojik[alt], img[alt].emojik'
+            + 'img.emojik[alt], img[alt].emojik,'
+            + 'img.emoji[alt], img[alt].emoji'
         );
         for (var r = reactionImgs.length - 1; r >= 0; r--) {
             var em = firstEmoji(reactionImgs[r].getAttribute('alt') || '');
             if (em) return em;
         }
         return firstEmoji(el.innerText || el.textContent || '');
-    }
-    function ariaParticipantRow(el) {
-        if (!el) return null;
-        if (el.getAttribute('role') === 'listitem') {
-            var selfAria = (el.getAttribute('aria-label') || '');
-            if (/\breacted\s+with\b/i.test(selfAria)) return el;
-        }
-        return el.closest('[role="listitem"][aria-label*="reacted"]');
     }
     function reactorKey(userName, phone) {
         var nameKey = normKey(userName || '');
@@ -699,27 +698,14 @@ return (function(dialog) {
         ).trim();
         return phoneFromText(sec) || sec;
     }
-    function reactorFromRow(el) {
-        if (!el) return null;
-        var ariaRow = ariaParticipantRow(el);
-        if (ariaRow) {
-            var ariaLabel = (ariaRow.getAttribute('aria-label') || '').trim();
-            var reactedMatch = ariaLabel.match(/^(.+?)\s+reacted\s+with\b/i);
-            if (reactedMatch) {
-                var raw = reactedMatch[1].trim();
-                var phone = phoneFromText(raw);
-                var userName = cleanName(raw);
-                if (!badName(userName) || phone) {
-                    return { user_name: userName, phone: phone || null };
-                }
-            }
-        }
-        var titleEl = el.querySelector(
+    function reactorFromParticipantRow(row) {
+        if (!row) return null;
+        var ariaLabel = (row.getAttribute('aria-label') || '').trim();
+        var titleEl = row.querySelector(
             '[data-testid="cell-frame-title"] span[title],'
             + '[data-testid="cell-frame-title"] span[dir],'
             + '[data-testid="cell-frame-primary"] span[title],'
-            + '[data-testid="cell-frame-primary"] span[dir="auto"],'
-            + 'span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]'
+            + '[data-testid="cell-frame-primary"] span[dir="auto"]'
         );
         var userName = '';
         if (titleEl) {
@@ -730,30 +716,28 @@ return (function(dialog) {
                 || ''
             );
         }
-        var phone = phoneFromSecondary(el) || phoneFromText(el.innerText || el.textContent || '');
-        if (!badName(userName)) {
-            return { user_name: userName, phone: phone || null };
-        }
-        var ariaLabel = (el.getAttribute('aria-label') || '').trim();
-        var reactedMatch = ariaLabel.match(/^(.+?)\s+reacted\s+with\b/i);
-        if (reactedMatch) {
-            var raw = reactedMatch[1].trim();
-            phone = phone || phoneFromText(raw);
-            userName = cleanName(raw);
-            if (!badName(userName) || phone) {
-                return { user_name: userName, phone: phone || null };
+        var phone = phoneFromSecondary(row) || '';
+        if (!userName && !phone && ariaLabel) {
+            var reactedMatch = ariaLabel.match(/^(.+?)\s+reacted\s+with\b/i);
+            if (reactedMatch) {
+                var raw = reactedMatch[1].trim();
+                phone = phoneFromText(raw);
+                userName = cleanName(raw);
             }
         }
-        if (phone) return { user_name: '', phone: phone };
-        var lines = (el.innerText || el.textContent || '').split('\n');
-        for (var j = 0; j < lines.length; j++) {
-            var line = cleanName(lines[j]);
-            if (!badName(line)) return { user_name: line, phone: null };
+        if (badName(userName) && !phone) return null;
+        if (looks_like_phone(userName)) {
+            phone = phone || userName;
+            userName = '';
         }
-        return null;
+        return { user_name: userName, phone: phone || null };
+    }
+    function looks_like_phone(text) {
+        return /^(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)$/.test((text || '').trim());
     }
     function addToGroup(em, reactor) {
-        em = em || 'unknown';
+        em = (em || '').trim();
+        if (!em) return;
         if (!reactor) return;
         var userName = cleanName(reactor.user_name || '');
         var phone = (reactor.phone || '').trim();
@@ -768,38 +752,38 @@ return (function(dialog) {
             phone: phone || null
         });
     }
+    function collectParticipantRow(row) {
+        if (!row || _waShouldSkipParticipantRow(row)) return;
+        var rowKey = row.getAttribute('aria-label') || row.getAttribute('data-testid') || String(row);
+        if (seenRows[rowKey]) return;
+        seenRows[rowKey] = true;
+        var em = rowEmoji(row);
+        var reactor = reactorFromParticipantRow(row);
+        if (reactor && em) addToGroup(em, reactor);
+    }
     function collect(root) {
         if (!root) return;
+        var ariaRows = root.querySelectorAll('[role="listitem"][aria-label*="reacted"]');
+        for (var i = 0; i < ariaRows.length; i++) {
+            collectParticipantRow(ariaRows[i]);
+        }
+        if (ariaRows.length > 0) return;
         var rows = root.querySelectorAll(
-            '[role="listitem"][aria-label*="reacted"],'
-            + '[data-testid="react-participant"],'
-            + '[data-testid="reactions-list-item"],'
-            + '[data-testid="reactions-details-cell-not-me"],'
+            '[data-testid="reactions-details-cell-not-me"],'
             + '[data-testid="reactions-details-cell-me"],'
-            + '[data-testid="reactions-list"] [role="listitem"],'
-            + '[data-testid="cell-frame-container"],'
-            + '[role="listitem"]'
+            + '[data-testid="react-participant"]'
         );
-        for (var i = 0; i < rows.length; i++) {
-            var row = rows[i];
-            if (_waShouldSkipParticipantRow(row)) continue;
-            var rowKey = (
-                row.getAttribute('aria-label')
-                || row.getAttribute('data-testid')
-                || row.innerText
-                || row.textContent
-                || String(i)
-            );
-            if (seenRows[rowKey]) continue;
-            seenRows[rowKey] = true;
-            var em = rowEmoji(row);
-            var reactor = reactorFromRow(row);
-            if (reactor) addToGroup(em, reactor);
+        for (var j = 0; j < rows.length; j++) {
+            var row = rows[j];
+            var ariaRow = row.closest('[role="listitem"][aria-label*="reacted"]') || row;
+            collectParticipantRow(ariaRow);
         }
     }
 
     var root = _waResolveReactionsRoot(dialog);
     if (!root) return [];
+
+    collect(root);
 
     var scrollTargets = _waReactionScrollTargets(root);
     for (var s = 0; s < scrollTargets.length; s++) {
@@ -818,7 +802,6 @@ return (function(dialog) {
     for (var k in grouped) {
         if (!grouped.hasOwnProperty(k)) continue;
         var g = grouped[k];
-        if (g.emoji === 'unknown') continue;
         out.push({ emoji: g.emoji, count: g.senders.length, senders: g.senders });
     }
     return out;

@@ -452,37 +452,44 @@ class ReactionExtractor:
             except StaleElementReferenceException:
                 continue
 
-    def _collect_senders_for_emoji(self, row_el, emoji: str) -> List[Contact]:
-        target = self._find_pill(row_el, emoji) or self._find_click_target(
-            row_el, emoji
-        )
-        if not target:
-            return []
 
+    def _grouped_to_reactions(self, grouped_raw: List[dict]) -> List[Reaction]:
+        return [
+            Reaction(
+                emoji=item["emoji"],
+                count=int(item.get("count", len(item.get("senders", [])))),
+                senders=dedupe_contacts(
+                    [
+                        r
+                        for r in (
+                            parse_contact(s) for s in item.get("senders", [])
+                        )
+                        if r is not None
+                    ]
+                ),
+            )
+            for item in grouped_raw
+            if item.get("emoji")
+        ]
+
+    def _collect_grouped_from_dialog(self, dialog) -> List[Reaction]:
         try:
-            click_element(self.driver, target)
-            jitter(0.35, 0.75)
-            dialog = self._wait_for_dialog()
-            self._click_tab(dialog, emoji)
-            self._wait_for_participants(dialog)
-            jitter(0.2, 0.4)
-            senders = self._collect_senders(dialog, "")
-            if not senders:
-                senders = self._collect_senders(dialog, emoji)
-            return senders
-        except (
-            TimeoutException,
-            StaleElementReferenceException,
-            ElementNotInteractableException,
-        ):
-            return []
-        finally:
-            self._dismiss_dialog()
-            jitter(0.15, 0.3)
+            grouped_raw = (
+                self.driver.execute_script(_JS_COLLECT_REACTORS_GROUPED, dialog) or []
+            )
+            if grouped_raw:
+                return self._grouped_to_reactions(grouped_raw)
+        except Exception:
+            pass
+        return []
 
     def _parse_from_dialog(
         self, dialog, basic: List[Reaction]
     ) -> List[Reaction]:
+        grouped = self._collect_grouped_from_dialog(dialog)
+        if grouped and any(r.senders for r in grouped):
+            return grouped
+
         try:
             tabs_raw = self.driver.execute_script(_JS_PARSE_REACTION_TABS, dialog) or []
         except Exception:
@@ -498,44 +505,16 @@ class ReactionExtractor:
                 self._click_tab(dialog, emoji)
                 self._wait_for_participants(dialog)
                 jitter(0.2, 0.4)
-                senders = self._collect_senders(dialog, "")
-                if not senders:
-                    senders = self._collect_senders(dialog, emoji)
+                tab_grouped = self._collect_grouped_from_dialog(dialog)
+                senders: List[Contact] = []
+                for rxn in tab_grouped:
+                    if emoji_matches(emoji, rxn.emoji):
+                        senders = rxn.senders
+                        break
                 detailed.append(Reaction(emoji=emoji, count=count, senders=senders))
-            return detailed
+            if any(r.senders for r in detailed):
+                return detailed
 
-        try:
-            grouped_raw = (
-                self.driver.execute_script(_JS_COLLECT_REACTORS_GROUPED, dialog) or []
-            )
-            if grouped_raw:
-                return [
-                    Reaction(
-                        emoji=item["emoji"],
-                        count=int(
-                            item.get("count", len(item.get("senders", [])))
-                        ),
-                        senders=dedupe_contacts(
-                            [
-                                r
-                                for r in (
-                                    parse_contact(s)
-                                    for s in item.get("senders", [])
-                                )
-                                if r is not None
-                            ]
-                        ),
-                    )
-                    for item in grouped_raw
-                    if item.get("emoji")
-                ]
-        except Exception:
-            pass
-
-        senders = self._collect_senders(dialog, "")
-        if senders and len(basic) == 1:
-            only = basic[0]
-            return [Reaction(emoji=only.emoji, count=only.count, senders=senders)]
         return []
 
     @staticmethod
@@ -562,16 +541,6 @@ class ReactionExtractor:
         if not basic:
             return []
 
-        detailed: List[Reaction] = []
-        for rxn in basic:
-            senders = self._collect_senders_for_emoji(row_el, rxn.emoji)
-            detailed.append(
-                Reaction(emoji=rxn.emoji, count=rxn.count, senders=senders)
-            )
-
-        if any(r.senders for r in detailed):
-            return detailed
-
         target = self._find_click_target(row_el, "")
         if not target:
             return basic
@@ -581,6 +550,7 @@ class ReactionExtractor:
             jitter(0.45, 0.9)
             dialog = self._wait_for_dialog()
             self._wait_for_participants(dialog)
+            jitter(0.2, 0.4)
             batch = self._parse_from_dialog(dialog, basic)
             self._dismiss_dialog()
             if batch and any(r.senders for r in batch):
