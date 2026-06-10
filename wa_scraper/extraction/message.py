@@ -18,6 +18,7 @@ from wa_scraper.js.message import (
     _JS_QUOTE_PARSE,
     _JS_SENDER,
 )
+from wa_scraper.contact import Contact, parse_contact
 from wa_scraper.models import Message, Quote
 from wa_scraper.selectors import MEDIA_CHECKS, S
 from wa_scraper.utils import find, find_all
@@ -121,41 +122,50 @@ class MessageExtractor:
                 parts.append(t)
         return "\n".join(parts).strip()
 
-    def extract_sender(self, row_el, is_out: bool) -> str:
+    def extract_sender(self, row_el, is_out: bool) -> Contact:
         if is_out:
-            return "You"
+            return Contact(user_name="You", phone=None)
         dom = self.parse_dom(row_el)
         if dom and dom.get("sender"):
-            return str(dom["sender"]).strip()
+            parsed = parse_contact(dom["sender"])
+            if parsed:
+                return parsed
         try:
             result = self.driver.execute_script(_JS_SENDER, row_el)
-            if result and result != "You":
-                return str(result).strip()
+            parsed = parse_contact(result)
+            if parsed and (parsed.user_name or parsed.phone):
+                return parsed
         except Exception:
             pass
 
         container = find(row_el, '[data-testid="msg-container"]') or row_el
         author_el = find(container, S["author"])
         if author_el:
-            a = author_el.text.strip()
-            if a:
-                return a
+            parsed = parse_contact(author_el.text.strip())
+            if parsed:
+                return parsed
 
         copyable = find(row_el, "[data-pre-plain-text]")
         if copyable:
             pre = copyable.get_attribute("data-pre-plain-text") or ""
             m = re.match(r"^\[[^\]]+\]\s*(.+?):\s*$", pre.strip())
             if m:
-                return m.group(1).strip()
+                parsed = parse_contact(m.group(1).strip())
+                if parsed:
+                    return parsed
 
-        return ""
+        return Contact(user_name="", phone=None)
+
+    def _parse_sender(self, raw) -> Contact:
+        parsed = parse_contact(raw)
+        return parsed or Contact(user_name="", phone=None)
 
     def parse_quote(self, row_el) -> Optional[Quote]:
         dom = self.parse_dom(row_el)
         if dom and dom.get("quote"):
             raw = dom["quote"]
             return Quote(
-                sender=(raw.get("sender") or "").strip(),
+                sender=self._parse_sender(raw.get("sender")),
                 text=(raw.get("text") or "").strip(),
             )
 
@@ -163,7 +173,7 @@ class MessageExtractor:
             raw = self.driver.execute_script(_JS_QUOTE_PARSE, row_el)
             if raw:
                 return Quote(
-                    sender=(raw.get("sender") or "").strip(),
+                    sender=self._parse_sender(raw.get("sender")),
                     text=(raw.get("text") or "").strip(),
                 )
         except Exception:
@@ -179,17 +189,18 @@ class MessageExtractor:
                 author_el = sp
                 break
         text_el = find(block, S["quote_text"])
-        q_sender = author_el.text.strip() if author_el else ""
+        q_sender_raw = author_el.text.strip() if author_el else ""
+        q_sender = self._parse_sender(q_sender_raw)
         q_text = text_el.text.strip() if text_el else ""
 
         if not q_text:
             for sp in find_all(block, "span[dir], div[dir]"):
                 t = sp.text.strip()
-                if t and t != q_sender and not re.match(r"^\d{1,2}:\d{2}", t):
+                if t and t != q_sender_raw and not re.match(r"^\d{1,2}:\d{2}", t):
                     q_text = t
                     break
 
-        if not q_sender and not q_text:
+        if not q_sender.user_name and not q_sender.phone and not q_text:
             return None
         return Quote(sender=q_sender, text=q_text)
 
@@ -212,11 +223,10 @@ class MessageExtractor:
             )
 
             quote = self.parse_quote(row_el)
-            sender = (
-                str(dom.get("sender") or "").strip()
-                if dom and dom.get("sender")
-                else self.extract_sender(row_el, is_out)
-            )
+            if dom and dom.get("sender"):
+                sender = self._parse_sender(dom.get("sender"))
+            else:
+                sender = self.extract_sender(row_el, is_out)
 
             msg_time = ""
             if dom and dom.get("time"):
@@ -241,7 +251,12 @@ class MessageExtractor:
                         media_type = mtype
                         break
 
-            if not sender and not text and media_type is None:
+            if (
+                not sender.user_name
+                and not sender.phone
+                and not text
+                and media_type is None
+            ):
                 return None
 
             scope = self.reaction_scope(row_el)

@@ -4,16 +4,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from wa_scraper.contact import Contact
+
+Reactor = Contact
+
+
 @dataclass
 class Reaction:
     emoji:   str
     count:   int
-    senders: List[str] = field(default_factory=list)
+    senders: List[Contact] = field(default_factory=list)
 
 
 @dataclass
 class Quote:
-    sender: str
+    sender: Contact
     text:   str
 
 
@@ -22,7 +27,7 @@ class Message:
     id:          str
     date:        str
     time:        str
-    sender:      str
+    sender:      Contact
     text:        str
     is_outgoing: bool
     quote:       Optional[Quote]    = None

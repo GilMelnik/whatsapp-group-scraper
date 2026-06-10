@@ -149,51 +149,158 @@ function _waOverlayLooksLikeReactions(root) {
     if (!root || !_waVisible(root)) return false;
     if (_waOverlayHasParticipants(root)) return true;
     if (root.getAttribute && root.getAttribute('data-testid') === 'reactions-list') return true;
-    if (root.getAttribute && root.getAttribute('role') === 'dialog') {
-        return !!root.querySelector(
-            '[data-testid="reactions-details-cell-not-me"],'
-            + '[data-testid="reactions-details-cell-me"],'
-            + '[role="listitem"][aria-label*="reacted"]'
-        );
-    }
+    if (root.querySelector && root.querySelector('[data-testid="reaction-count-header"]')) return true;
     return !!root.querySelector('[data-testid="reactions-tab"], [role="tablist"]');
 }
+function _waCountParticipants(root) {
+    if (!root) return 0;
+    return root.querySelectorAll(
+        '[role="listitem"][aria-label*="reacted"],'
+        + '[data-testid="reactions-details-cell-not-me"],'
+        + '[data-testid="reactions-details-cell-me"],'
+        + '[data-testid="react-participant"]'
+    ).length;
+}
+function _waExpectedReactionCount(root) {
+    if (!root) return 0;
+    var header = root.querySelector('[data-testid="reaction-count-header"]');
+    if (!header && root.getAttribute && root.getAttribute('data-testid') === 'reaction-count-header') {
+        header = root;
+    }
+    if (!header) return 0;
+    var txt = (header.innerText || header.textContent || '').trim();
+    var m = txt.match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : 0;
+}
+function _waContainerFromReactionHeader(headerEl) {
+    if (!headerEl) return null;
+    var container = headerEl.parentElement;
+    while (container && container !== document.body) {
+        if (_waCountParticipants(container) > 0 && _waVisible(container)) {
+            return container;
+        }
+        container = container.parentElement;
+    }
+    return headerEl.parentElement || null;
+}
+function _waAddReactionRootCandidate(candidates, seen, el) {
+    if (!el || seen[el]) return;
+    seen[el] = true;
+    candidates.push(el);
+}
+function _waPickBestReactionsRoot(candidates) {
+    var best = null;
+    var bestScore = 0;
+    for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i];
+        if (!el || !_waVisible(el)) continue;
+        var count = _waCountParticipants(el);
+        var expected = _waExpectedReactionCount(el);
+        if (count <= 0 && expected <= 0 && !_waOverlayHasParticipants(el)) continue;
+        var score = Math.max(count, expected);
+        if (score > bestScore) {
+            best = el;
+            bestScore = score;
+        }
+    }
+    return best;
+}
 function _waResolveReactionsRoot(dialog) {
+    var candidates = [];
+    var seen = {};
+
     if (dialog) {
         var chain = dialog;
-        while (chain) {
-            if (_waOverlayLooksLikeReactions(chain)) return chain;
+        while (chain && chain !== document.body) {
+            _waAddReactionRootCandidate(candidates, seen, chain);
             if (chain.getAttribute && chain.getAttribute('data-testid') === 'drawer-right') {
-                return chain;
+                break;
             }
             chain = chain.parentElement;
         }
+        var headerFromDialog = dialog.closest('[data-testid="reaction-count-header"]');
+        if (headerFromDialog) {
+            _waAddReactionRootCandidate(
+                candidates, seen, _waContainerFromReactionHeader(headerFromDialog)
+            );
+        }
         var drawer = dialog.closest('[data-testid="drawer-right"]');
-        if (drawer && _waVisible(drawer)) return drawer;
+        if (drawer) {
+            _waAddReactionRootCandidate(candidates, seen, drawer);
+        }
     }
-    var nodes = document.querySelectorAll(
-        '[data-testid="drawer-right"],'
-        + '[data-testid="reactions-list"],'
-        + '[role="dialog"],'
-        + '[role="list"]'
+
+    var headers = document.querySelectorAll('[data-testid="reaction-count-header"]');
+    for (var h = headers.length - 1; h >= 0; h--) {
+        if (!_waVisible(headers[h])) continue;
+        _waAddReactionRootCandidate(
+            candidates, seen, _waContainerFromReactionHeader(headers[h])
+        );
+    }
+
+    var lists = document.querySelectorAll(
+        '[data-testid="reactions-list"], [data-testid="drawer-right"]'
     );
-    for (var i = nodes.length - 1; i >= 0; i--) {
-        if (_waOverlayLooksLikeReactions(nodes[i])) return nodes[i];
+    for (var l = lists.length - 1; l >= 0; l--) {
+        _waAddReactionRootCandidate(candidates, seen, lists[l]);
     }
+
+    var reactedRows = document.querySelectorAll('[role="listitem"][aria-label*="reacted"]');
+    for (var r = reactedRows.length - 1; r >= 0; r--) {
+        var row = reactedRows[r];
+        var header = row.closest('[data-testid="reaction-count-header"]');
+        if (header) {
+            _waAddReactionRootCandidate(
+                candidates, seen, _waContainerFromReactionHeader(header)
+            );
+            continue;
+        }
+        var drawerRow = row.closest('[data-testid="drawer-right"]');
+        if (drawerRow) {
+            _waAddReactionRootCandidate(candidates, seen, drawerRow);
+            continue;
+        }
+        var parent = row.parentElement;
+        while (parent && parent !== document.body) {
+            if (_waCountParticipants(parent) > 1) {
+                _waAddReactionRootCandidate(candidates, seen, parent);
+                break;
+            }
+            if (parent.getAttribute && parent.getAttribute('role') === 'list') {
+                _waAddReactionRootCandidate(candidates, seen, parent);
+            }
+            parent = parent.parentElement;
+        }
+    }
+
+    var best = _waPickBestReactionsRoot(candidates);
+    if (best) return best;
+
     var detailCell = document.querySelector(
         '[data-testid="reactions-details-cell-not-me"],'
         + '[data-testid="reactions-details-cell-me"],'
         + '[role="listitem"][aria-label*="reacted"]'
     );
     if (detailCell) {
-        return (
-            detailCell.closest('[role="dialog"]')
-            || detailCell.closest('[role="list"]')
-            || detailCell.closest('[data-testid="drawer-right"]')
-            || detailCell
-        );
+        var parent = detailCell.parentElement;
+        while (parent && parent !== document.body) {
+            if (_waCountParticipants(parent) > 0 && _waVisible(parent)) {
+                return parent;
+            }
+            parent = parent.parentElement;
+        }
     }
     return dialog || null;
+}
+function _waShouldSkipParticipantRow(el) {
+    if (!el || el.getAttribute('role') !== 'listitem') return false;
+    var aria = (el.getAttribute('aria-label') || '');
+    if (/\breacted\s+with\b/i.test(aria)) return false;
+    return !!el.querySelector(
+        '[data-testid="reactions-details-cell-not-me"],'
+        + '[data-testid="reactions-details-cell-me"],'
+        + '[data-testid="react-participant"]'
+    );
 }
 function _waReactionScrollTargets(root) {
     var out = [];
@@ -207,6 +314,7 @@ function _waReactionScrollTargets(root) {
     add(root.querySelector('[data-scrolltraceid]'));
     add(root.querySelector('[data-testid="reactions-list"] [role="list"]'));
     add(root.querySelector('[data-testid="reactions-list"]'));
+    add(root.querySelector('[role="list"] [data-testid^="list-item-"]') && root.querySelector('[role="list"] [data-testid^="list-item-"]').parentElement);
     add(root.querySelector('[role="list"]'));
     add(root);
     return out;
@@ -232,11 +340,21 @@ return (function(dialog) {
 """
 )
 
+_JS_EXPECTED_REACTION_COUNT = (
+    _JS_REACTIONS_OVERLAY_HELPERS
+    + r"""
+return (function(dialog) {
+    var root = _waResolveReactionsRoot(dialog);
+    return _waExpectedReactionCount(root);
+})(arguments[0]);
+"""
+)
+
 _JS_COLLECT_REACTORS = (
     _JS_REACTIONS_OVERLAY_HELPERS
     + r"""
 return (function(dialog, targetEmoji) {
-    var names = [];
+    var reactors = [];
     var seen = {};
     targetEmoji = targetEmoji || '';
 
@@ -283,27 +401,43 @@ return (function(dialog, targetEmoji) {
         var m = (s || '').match(/(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)/);
         return m ? m[1].trim() : '';
     }
-    function addName(n) {
-        n = cleanName(n);
-        if (badName(n)) return;
-        var key = normKey(n);
-        if (seen[key]) return;
-        seen[key] = true;
-        names.push(n);
+    function reactorKey(userName, phone) {
+        var nameKey = normKey(userName || '');
+        if (nameKey) return nameKey;
+        return (phone || '').replace(/\s+/g, '');
     }
-    function shouldSkipParticipantRow(el) {
-        if (!el || el.getAttribute('role') !== 'listitem') return false;
-        return !!el.querySelector(
-            '[data-testid="reactions-details-cell-not-me"],'
-            + '[data-testid="reactions-details-cell-me"],'
-            + '[data-testid="react-participant"]'
+    function addReactor(userName, phone) {
+        userName = cleanName(userName || '');
+        phone = (phone || '').trim();
+        if (badName(userName) && !phone) return;
+        var key = reactorKey(userName, phone);
+        if (!key || seen[key]) return;
+        seen[key] = true;
+        reactors.push({
+            user_name: userName,
+            phone: phone || null
+        });
+    }
+    function phoneFromSecondary(el) {
+        var secondary = el.querySelector(
+            '[data-testid="cell-frame-secondary"],'
+            + '[data-testid="cell-frame-subtitle"]'
         );
+        if (!secondary) return '';
+        var sec = (
+            secondary.getAttribute('title')
+            || secondary.innerText
+            || secondary.textContent
+            || ''
+        ).trim();
+        return phoneFromText(sec) || sec;
     }
     function rowEmoji(el) {
         if (!el) return '';
         var reactionImgs = el.querySelectorAll(
             '[data-testid="reaction-bubble-item"] img[alt],'
-            + '[data-testid="reactions-list-item"] img[alt]'
+            + '[data-testid="reactions-list-item"] img[alt],'
+            + 'img.emojik[alt], img[alt].emojik'
         );
         for (var r = reactionImgs.length - 1; r >= 0; r--) {
             var altR = (reactionImgs[r].getAttribute('alt') || '').trim();
@@ -312,17 +446,32 @@ return (function(dialog, targetEmoji) {
         }
         return firstEmoji(el.innerText || el.textContent || '');
     }
-    function nameFromAriaLabel(el) {
+    function reactorFromAriaLabel(el) {
         var ariaLabel = (el.getAttribute('aria-label') || '').trim();
         var reactedMatch = ariaLabel.match(/^(.+?)\s+reacted\s+with\b/i);
-        if (reactedMatch) {
-            addName(reactedMatch[1]);
+        if (!reactedMatch) return false;
+        var raw = reactedMatch[1].trim();
+        var phone = phoneFromText(raw);
+        var userName = cleanName(raw);
+        if (!badName(userName) || phone) {
+            addReactor(userName, phone);
             return true;
         }
         return false;
     }
+    function ariaParticipantRow(el) {
+        if (!el) return null;
+        if (el.getAttribute('role') === 'listitem') {
+            var selfAria = (el.getAttribute('aria-label') || '');
+            if (/\breacted\s+with\b/i.test(selfAria)) return el;
+        }
+        return el.closest('[role="listitem"][aria-label*="reacted"]');
+    }
     function nameFromRow(el) {
         if (!el || isTab(el)) return;
+        var ariaRow = ariaParticipantRow(el);
+        if (ariaRow && reactorFromAriaLabel(ariaRow)) return;
+
         var em = rowEmoji(el);
         if (targetEmoji && em && !emojiMatches(em, targetEmoji)) return;
 
@@ -334,30 +483,19 @@ return (function(dialog, targetEmoji) {
             + '[data-testid="cell-frame-primary"] span[title],'
             + '[data-testid="cell-frame-primary"] span[dir="auto"]'
         );
+        var userName = '';
         if (titleEl) {
-            var n = cleanName(
+            userName = cleanName(
                 titleEl.getAttribute('title')
                 || titleEl.innerText
                 || titleEl.textContent
                 || ''
             );
-            if (!badName(n)) { addName(n); return; }
         }
-
-        if (nameFromAriaLabel(el)) return;
-
-        var secondary = el.querySelector(
-            '[data-testid="cell-frame-secondary"],'
-            + '[data-testid="cell-frame-subtitle"]'
-        );
-        if (secondary) {
-            var sec = cleanName(
-                secondary.getAttribute('title')
-                || secondary.innerText
-                || secondary.textContent
-                || ''
-            );
-            if (!badName(sec)) { addName(sec); return; }
+        var phone = phoneFromSecondary(el) || phoneFromText(el.innerText || el.textContent || '');
+        if (!badName(userName)) {
+            addReactor(userName, phone);
+            return;
         }
 
         var picks = el.querySelectorAll('span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]');
@@ -365,43 +503,53 @@ return (function(dialog, targetEmoji) {
             var pick = picks[i];
             if (isTab(pick)) continue;
             if (pick.closest('[data-testid="reactions-tab"], [role="tablist"]')) continue;
-            n = cleanName(pick.getAttribute('title') || pick.innerText || pick.textContent || '');
-            if (!badName(n)) { addName(n); return; }
+            userName = cleanName(pick.getAttribute('title') || pick.innerText || pick.textContent || '');
+            if (!badName(userName)) {
+                addReactor(userName, phone);
+                return;
+            }
         }
 
-        var phone = phoneFromText(el.innerText || el.textContent || '');
-        if (phone && !seen[phone]) {
-            seen[phone] = true;
-            names.push(phone);
+        if (phone) {
+            addReactor('', phone);
             return;
         }
 
         var lines = (el.innerText || el.textContent || '').split('\n');
         for (var j = 0; j < lines.length; j++) {
             var line = cleanName(lines[j]);
-            if (!badName(line)) { addName(line); return; }
+            if (!badName(line)) {
+                addReactor(line, '');
+                return;
+            }
         }
     }
     function collect(root) {
         if (!root) return;
+        var ariaRows = root.querySelectorAll('[role="listitem"][aria-label*="reacted"]');
+        for (var a = 0; a < ariaRows.length; a++) {
+            nameFromRow(ariaRows[a]);
+        }
         var rows = root.querySelectorAll(
-            '[data-testid="react-participant"],'
+            '[role="listitem"][aria-label*="reacted"],'
+            + '[data-testid="react-participant"],'
             + '[data-testid="reactions-list-item"],'
             + '[data-testid="reactions-details-cell-not-me"],'
             + '[data-testid="reactions-details-cell-me"],'
             + '[data-testid="reactions-list"] [role="listitem"],'
-            + '[role="listitem"][aria-label*="reacted"],'
-            + '[role="listitem"],'
-            + '[data-testid="cell-frame-container"]'
+            + '[data-testid="cell-frame-container"],'
+            + '[role="listitem"]'
         );
         for (var i = 0; i < rows.length; i++) {
-            if (shouldSkipParticipantRow(rows[i])) continue;
+            if (_waShouldSkipParticipantRow(rows[i])) continue;
             nameFromRow(rows[i]);
         }
     }
 
     var root = _waResolveReactionsRoot(dialog);
-    if (!root) return names;
+    if (!root) return reactors;
+
+    collect(root);
 
     var scrollTargets = _waReactionScrollTargets(root);
     for (var s = 0; s < scrollTargets.length; s++) {
@@ -415,7 +563,7 @@ return (function(dialog, targetEmoji) {
             collect(scrollEl);
         }
     }
-    return names;
+    return reactors;
 })(arguments[0], arguments[1]);
 """
 )
@@ -511,19 +659,12 @@ return (function(dialog) {
         var m = (s || '').match(/(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)/);
         return m ? m[1].trim() : '';
     }
-    function shouldSkipParticipantRow(el) {
-        if (!el || el.getAttribute('role') !== 'listitem') return false;
-        return !!el.querySelector(
-            '[data-testid="reactions-details-cell-not-me"],'
-            + '[data-testid="reactions-details-cell-me"],'
-            + '[data-testid="react-participant"]'
-        );
-    }
     function rowEmoji(el) {
         if (!el) return '';
         var reactionImgs = el.querySelectorAll(
             '[data-testid="reaction-bubble-item"] img[alt],'
-            + '[data-testid="reactions-list-item"] img[alt]'
+            + '[data-testid="reactions-list-item"] img[alt],'
+            + 'img.emojik[alt], img[alt].emojik'
         );
         for (var r = reactionImgs.length - 1; r >= 0; r--) {
             var em = firstEmoji(reactionImgs[r].getAttribute('alt') || '');
@@ -531,13 +672,48 @@ return (function(dialog) {
         }
         return firstEmoji(el.innerText || el.textContent || '');
     }
-    function nameFromAriaLabel(el) {
-        var ariaLabel = (el.getAttribute('aria-label') || '').trim();
-        var reactedMatch = ariaLabel.match(/^(.+?)\s+reacted\s+with\b/i);
-        return reactedMatch ? cleanName(reactedMatch[1]) : '';
+    function ariaParticipantRow(el) {
+        if (!el) return null;
+        if (el.getAttribute('role') === 'listitem') {
+            var selfAria = (el.getAttribute('aria-label') || '');
+            if (/\breacted\s+with\b/i.test(selfAria)) return el;
+        }
+        return el.closest('[role="listitem"][aria-label*="reacted"]');
     }
-    function nameFromRow(el) {
-        if (!el) return '';
+    function reactorKey(userName, phone) {
+        var nameKey = normKey(userName || '');
+        if (nameKey) return nameKey;
+        return (phone || '').replace(/\s+/g, '');
+    }
+    function phoneFromSecondary(el) {
+        var secondary = el.querySelector(
+            '[data-testid="cell-frame-secondary"],'
+            + '[data-testid="cell-frame-subtitle"]'
+        );
+        if (!secondary) return '';
+        var sec = (
+            secondary.getAttribute('title')
+            || secondary.innerText
+            || secondary.textContent
+            || ''
+        ).trim();
+        return phoneFromText(sec) || sec;
+    }
+    function reactorFromRow(el) {
+        if (!el) return null;
+        var ariaRow = ariaParticipantRow(el);
+        if (ariaRow) {
+            var ariaLabel = (ariaRow.getAttribute('aria-label') || '').trim();
+            var reactedMatch = ariaLabel.match(/^(.+?)\s+reacted\s+with\b/i);
+            if (reactedMatch) {
+                var raw = reactedMatch[1].trim();
+                var phone = phoneFromText(raw);
+                var userName = cleanName(raw);
+                if (!badName(userName) || phone) {
+                    return { user_name: userName, phone: phone || null };
+                }
+            }
+        }
         var titleEl = el.querySelector(
             '[data-testid="cell-frame-title"] span[title],'
             + '[data-testid="cell-frame-title"] span[dir],'
@@ -545,58 +721,80 @@ return (function(dialog) {
             + '[data-testid="cell-frame-primary"] span[dir="auto"],'
             + 'span[title], span[dir="auto"], span[dir="ltr"], span[dir="rtl"]'
         );
+        var userName = '';
         if (titleEl) {
-            var n = cleanName(
+            userName = cleanName(
                 titleEl.getAttribute('title')
                 || titleEl.innerText
                 || titleEl.textContent
                 || ''
             );
-            if (!badName(n)) return n;
         }
-        var fromAria = nameFromAriaLabel(el);
-        if (fromAria && !badName(fromAria)) return fromAria;
-        var phone = phoneFromText(el.innerText || el.textContent || '');
-        if (phone) return phone;
+        var phone = phoneFromSecondary(el) || phoneFromText(el.innerText || el.textContent || '');
+        if (!badName(userName)) {
+            return { user_name: userName, phone: phone || null };
+        }
+        var ariaLabel = (el.getAttribute('aria-label') || '').trim();
+        var reactedMatch = ariaLabel.match(/^(.+?)\s+reacted\s+with\b/i);
+        if (reactedMatch) {
+            var raw = reactedMatch[1].trim();
+            phone = phone || phoneFromText(raw);
+            userName = cleanName(raw);
+            if (!badName(userName) || phone) {
+                return { user_name: userName, phone: phone || null };
+            }
+        }
+        if (phone) return { user_name: '', phone: phone };
         var lines = (el.innerText || el.textContent || '').split('\n');
         for (var j = 0; j < lines.length; j++) {
             var line = cleanName(lines[j]);
-            if (!badName(line)) return line;
+            if (!badName(line)) return { user_name: line, phone: null };
         }
-        return '';
+        return null;
     }
-    function addToGroup(em, n) {
+    function addToGroup(em, reactor) {
         em = em || 'unknown';
-        n = cleanName(n);
-        if (!n || badName(n)) return;
+        if (!reactor) return;
+        var userName = cleanName(reactor.user_name || '');
+        var phone = (reactor.phone || '').trim();
+        if (badName(userName) && !phone) return;
         var key = normEmoji(em) || em;
         if (!grouped[key]) grouped[key] = { emoji: em, senders: [], seen: {} };
-        var nameKey = normKey(n);
-        if (grouped[key].seen[nameKey]) return;
+        var nameKey = reactorKey(userName, phone);
+        if (!nameKey || grouped[key].seen[nameKey]) return;
         grouped[key].seen[nameKey] = true;
-        grouped[key].senders.push(n);
+        grouped[key].senders.push({
+            user_name: userName,
+            phone: phone || null
+        });
     }
     function collect(root) {
         if (!root) return;
         var rows = root.querySelectorAll(
-            '[data-testid="react-participant"],'
+            '[role="listitem"][aria-label*="reacted"],'
+            + '[data-testid="react-participant"],'
             + '[data-testid="reactions-list-item"],'
             + '[data-testid="reactions-details-cell-not-me"],'
             + '[data-testid="reactions-details-cell-me"],'
             + '[data-testid="reactions-list"] [role="listitem"],'
-            + '[role="listitem"][aria-label*="reacted"],'
-            + '[role="listitem"],'
-            + '[data-testid="cell-frame-container"]'
+            + '[data-testid="cell-frame-container"],'
+            + '[role="listitem"]'
         );
         for (var i = 0; i < rows.length; i++) {
             var row = rows[i];
-            if (shouldSkipParticipantRow(row)) continue;
-            var rowKey = row.innerText || row.textContent || String(i);
+            if (_waShouldSkipParticipantRow(row)) continue;
+            var rowKey = (
+                row.getAttribute('aria-label')
+                || row.getAttribute('data-testid')
+                || row.innerText
+                || row.textContent
+                || String(i)
+            );
             if (seenRows[rowKey]) continue;
             seenRows[rowKey] = true;
             var em = rowEmoji(row);
-            var n = nameFromRow(row);
-            if (n) addToGroup(em, n);
+            var reactor = reactorFromRow(row);
+            if (reactor) addToGroup(em, reactor);
         }
     }
 

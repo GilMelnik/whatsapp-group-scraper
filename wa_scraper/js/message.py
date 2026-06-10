@@ -115,13 +115,42 @@ function _waLooksLikeIconLigature(s) {
     if (/\s/.test(s) || !/^[a-z0-9_-]+$/.test(s)) return false;
     return s.indexOf('-') >= 0 && s.length > 3;
 }
+function _waPhoneFromText(s) {
+    var m = (s || '').match(/(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)/);
+    return m ? m[1].trim() : '';
+}
+function _waLooksLikePhone(s) {
+    s = (s || '').trim();
+    return /^(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)$/.test(s);
+}
+function _waCleanContactName(n) {
+    n = (n || '').trim();
+    n = n.replace(/^~\s*/, '');
+    n = n.replace(/^Maybe\s+/i, '');
+    n = n.replace(
+        /,\s*(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)\s*$/,
+        ''
+    );
+    return n.trim();
+}
+function _waParseContact(raw) {
+    raw = (raw || '').trim();
+    if (!raw) return { user_name: '', phone: null };
+    if (raw === 'You') return { user_name: 'You', phone: null };
+    if (_waLooksLikePhone(raw)) return { user_name: '', phone: raw };
+    var phone = _waPhoneFromText(raw);
+    var userName = _waCleanContactName(raw);
+    if (!userName && phone) return { user_name: '', phone: phone };
+    if (_waLooksLikePhone(userName)) return { user_name: '', phone: userName };
+    return { user_name: userName, phone: phone || null };
+}
 function _waParsePrePlain(row) {
     var el = row.querySelector('[data-pre-plain-text]');
     if (!el) return null;
     var pre = el.getAttribute('data-pre-plain-text') || '';
     var m = pre.match(/^\[([^\]]+)\]\s*(.+?):\s*$/);
     if (!m) return null;
-    return { time: m[1].trim(), sender: m[2].trim() };
+    return { time: m[1].trim(), sender: _waParseContact(m[2].trim()) };
 }
 function _waFindQuoteBlock(row) {
     var root = _waMsgRoot(row);
@@ -234,7 +263,7 @@ function _waExtractQuote(block) {
         }
     }
     if (!sender && !text) return null;
-    return { sender: sender, text: text };
+    return { sender: _waParseContact(sender), text: text };
 }
 function _waExtractBody(container, quoteBlock, authorEl, skip) {
     // 1 — WhatsApp body wrapper (div._akbu) sitting beside the quote preview
@@ -268,15 +297,15 @@ function _waExtractBody(container, quoteBlock, authorEl, skip) {
     return '';
 }
 function _waExtractSender(row, container, isOut, quoteBlock) {
-    if (isOut) return 'You';
+    if (isOut) return { user_name: 'You', phone: null };
 
     var sender = _waFindMsgAuthor(container, quoteBlock);
-    if (sender) return sender;
+    if (sender) return _waParseContact(sender);
 
     var pre = _waParsePrePlain(row);
     if (pre && pre.sender) return pre.sender;
 
-    return '';
+    return { user_name: '', phone: null };
 }
 function _waExtractTime(container) {
     var meta = container.querySelector('[data-testid="msg-meta"]');

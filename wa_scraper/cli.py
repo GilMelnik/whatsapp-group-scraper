@@ -24,15 +24,18 @@ Output format  (wa_chat.json):
     "id":          "false_12345678901@g.us_ABCDEF0123",
     "date":        "07/06/2025",
     "time":        "14:32",
-    "sender":      "Alice",
+    "sender":      { "user_name": "Alice", "phone": null },
     "text":        "See you tomorrow!",
     "is_outgoing": false,
     "quote": {
-      "sender": "Bob",
+      "sender": { "user_name": "Bob", "phone": null },
       "text":   "Are you coming?"
     },
     "reactions": [
-      { "emoji": "👍", "count": 2, "senders": ["Bob", "Carol"] }
+      { "emoji": "👍", "count": 2, "senders": [
+          { "user_name": "Bob", "phone": null },
+          { "user_name": "Carol", "phone": "+1 555-0100" }
+        ] }
     ],
     "media_type": null
   },
@@ -41,14 +44,16 @@ Output format  (wa_chat.json):
 
 Captured fields
 ───────────────
-  • sender       – nickname shown in WhatsApp (or "You" for outgoing messages)
+  • sender       – { user_name, phone } for the message author
+                   ("You" for outgoing messages; phone-only when unsaved)
   • date         – calendar date from the chat's date-separator cards
   • time         – HH:MM (or H:MM AM/PM, matching your locale)
   • text         – raw message text (empty for media-only messages)
   • is_outgoing  – true if YOU sent the message
-  • quote        – sender + text of the replied-to message, or null
+  • quote        – { sender: { user_name, phone }, text } or null
   • reactions    – list of { emoji, count, senders[] }
-                   senders lists who reacted (disable with --no-reactions-detail)
+                   senders lists who reacted as { user_name, phone }
+                   (disable with --no-reactions-detail)
   • media_type   – "image" | "video" | "audio" | "sticker" | "document"
                    "gif" | "location" | null
 

@@ -19,10 +19,18 @@ from selenium.webdriver.support.ui import WebDriverWait
 from wa_scraper.js.reactions import (
     _JS_COLLECT_REACTORS,
     _JS_COLLECT_REACTORS_GROUPED,
+    _JS_EXPECTED_REACTION_COUNT,
     _JS_FIND_REACTIONS_OVERLAY,
     _JS_HAS_REACTION_PARTICIPANTS,
     _JS_PARSE_REACTION_TABS,
     _JS_REACTIONS,
+)
+from wa_scraper.contact import (
+    Contact,
+    contact_dedup_key,
+    dedupe_contacts,
+    extract_phone,
+    parse_contact,
 )
 from wa_scraper.models import Reaction
 from wa_scraper.selectors import S
@@ -34,24 +42,6 @@ from wa_scraper.utils import (
     jitter,
     normalize_emoji,
 )
-
-_PHONE_SUFFIX_RE = re.compile(
-    r",\s*(\+\d[\d\s\-()]{7,}\d|\d[\d\s\-()]{8,}\d)\s*$"
-)
-_MAYBE_PREFIX_RE = re.compile(r"^Maybe\s+", re.I)
-
-
-def _clean_reactor_name(name: str) -> str:
-    name = name.strip()
-    name = re.sub(r"^~\s*", "", name)
-    name = _MAYBE_PREFIX_RE.sub("", name)
-    name = _PHONE_SUFFIX_RE.sub("", name).strip()
-    return name.strip()
-
-
-def _reactor_dedup_key(name: str) -> str:
-    return _clean_reactor_name(name).lower()
-
 
 class ReactionExtractor:
     """Extracts emoji reactions and optional reactor names from message rows."""
@@ -85,16 +75,23 @@ class ReactionExtractor:
                     last_err = exc
 
             dialog_candidates = self.driver.find_elements(
-                By.CSS_SELECTOR, S["rxn_dialog"]
+                By.CSS_SELECTOR,
+                (
+                    '[data-testid="reaction-count-header"],'
+                    '[data-testid="reactions-list"],'
+                    '[data-testid="drawer-right"],'
+                    '[role="list"]'
+                ),
             )
             for el in reversed(dialog_candidates):
                 try:
                     if not el.is_displayed():
                         continue
-                    if self.driver.execute_script(
-                        _JS_HAS_REACTION_PARTICIPANTS, el
-                    ):
-                        return el
+                    overlay = self.driver.execute_script(
+                        _JS_FIND_REACTIONS_OVERLAY, el
+                    )
+                    if overlay and overlay.is_displayed():
+                        return overlay
                 except StaleElementReferenceException as exc:
                     last_err = exc
 
@@ -108,20 +105,11 @@ class ReactionExtractor:
             )
             for el in reversed(detail_cells):
                 try:
-                    dialog = self.driver.execute_script(
-                        """
-                        var el = arguments[0];
-                        return (
-                            el.closest('[role="dialog"]')
-                            || el.closest('[role="list"]')
-                            || el.closest('[data-testid="drawer-right"]')
-                            || el
-                        );
-                        """,
-                        el,
+                    overlay = self.driver.execute_script(
+                        _JS_FIND_REACTIONS_OVERLAY, el
                     )
-                    if dialog and dialog.is_displayed():
-                        return dialog
+                    if overlay and overlay.is_displayed():
+                        return overlay
                 except StaleElementReferenceException as exc:
                     last_err = exc
             time.sleep(0.15)
@@ -171,39 +159,44 @@ class ReactionExtractor:
                 pass
         return results
 
-    def _collect_senders(self, dialog, emoji: str = "") -> List[str]:
+    def _collect_senders(self, dialog, emoji: str = "") -> List[Contact]:
+        expected_count = 0
         try:
-            names = (
+            expected_count = int(
+                self.driver.execute_script(_JS_EXPECTED_REACTION_COUNT, dialog) or 0
+            )
+        except Exception:
+            pass
+
+        try:
+            raw_reactors = (
                 self.driver.execute_script(_JS_COLLECT_REACTORS, dialog, emoji) or []
             )
-            cleaned: List[str] = []
-            js_seen: set = set()
-            for raw in names:
-                n = _clean_reactor_name(str(raw))
-                if not n:
-                    continue
-                key = _reactor_dedup_key(n)
-                if key in js_seen:
-                    continue
-                js_seen.add(key)
-                cleaned.append(n)
-            if cleaned:
+            parsed = [
+                r
+                for r in (parse_contact(raw) for raw in raw_reactors)
+                if r is not None
+            ]
+            cleaned = dedupe_contacts(parsed)
+            if cleaned and (not expected_count or len(cleaned) >= expected_count):
                 return cleaned
         except Exception:
             pass
 
-        senders: List[str] = []
+        senders: List[Contact] = []
         seen: set = set()
 
-        def add_sender(raw_name: str) -> bool:
-            n = _clean_reactor_name(raw_name)
-            if not n or re.fullmatch(r"\d+", n):
+        def add_reactor(user_name: str = "", phone: str = "") -> bool:
+            reactor = parse_contact({"user_name": user_name, "phone": phone})
+            if reactor is None:
                 return False
-            key = _reactor_dedup_key(n)
+            if reactor.user_name and re.fullmatch(r"\d+", reactor.user_name):
+                return False
+            key = contact_dedup_key(reactor)
             if key in seen:
                 return False
             seen.add(key)
-            senders.append(n)
+            senders.append(reactor)
             return True
 
         try:
@@ -226,9 +219,12 @@ class ReactionExtractor:
                 try:
                     role = (row.get_attribute("role") or "").lower()
                     testid = row.get_attribute("data-testid") or ""
+                    aria = (row.get_attribute("aria-label") or "").strip()
                     if role == "tab" or testid == "reactions-tab":
                         continue
-                    if role == "listitem" and find(
+                    if role == "listitem" and not re.search(
+                        r"\breacted\s+with\b", aria, re.I
+                    ) and find(
                         row,
                         (
                             '[data-testid="reactions-details-cell-not-me"],'
@@ -237,33 +233,72 @@ class ReactionExtractor:
                         ),
                     ):
                         continue
+
+                    reacted = re.match(r"^(.+?)\s+reacted\s+with\b", aria, re.I)
+                    if reacted:
+                        parsed = parse_contact(reacted.group(1).strip())
+                        if parsed and add_reactor(parsed.user_name, parsed.phone or ""):
+                            continue
+
+                    if role != "listitem":
+                        aria = (
+                            self.driver.execute_script(
+                                """
+                                var el = arguments[0];
+                                var row = el.closest(
+                                    '[role="listitem"][aria-label*="reacted"]'
+                                );
+                                return row ? (row.getAttribute('aria-label') || '') : '';
+                                """,
+                                row,
+                            )
+                            or ""
+                        ).strip()
+                        reacted = re.match(r"^(.+?)\s+reacted\s+with\b", aria, re.I)
+                        if reacted:
+                            parsed = parse_contact(reacted.group(1).strip())
+                            if parsed and add_reactor(
+                                parsed.user_name, parsed.phone or ""
+                            ):
+                                continue
                 except StaleElementReferenceException:
                     continue
 
-                found_name = False
+                user_name = ""
+                phone = ""
+                title_el = find(row, '[data-testid="cell-frame-title"] span[dir],'
+                                '[data-testid="cell-frame-title"] span[title]')
+                if title_el:
+                    user_name = (
+                        title_el.get_attribute("title") or title_el.text or ""
+                    ).strip()
+
+                secondary_el = find(
+                    row,
+                    '[data-testid="cell-frame-secondary"],'
+                    '[data-testid="cell-frame-subtitle"]',
+                )
+                if secondary_el:
+                    sec_text = (
+                        secondary_el.get_attribute("title") or secondary_el.text or ""
+                    ).strip()
+                    phone = extract_phone(sec_text) or sec_text
+
+                if user_name and add_reactor(user_name, phone):
+                    continue
+
                 for name_el in find_all(row, S["rxn_name"]):
                     n = (name_el.get_attribute("title") or name_el.text or "").strip()
-                    if n and add_sender(n):
-                        found_name = True
+                    if n and add_reactor(n, phone):
                         break
-
-                if found_name:
-                    continue
-
-                if not find_all(row, S["rxn_name"]):
-                    for sp in find_all(row, 'span[title], span[dir="auto"]'):
-                        n = (sp.get_attribute("title") or sp.text or "").strip()
-                        if n and add_sender(n):
-                            found_name = True
-                            break
-
-                if found_name:
-                    continue
-
-                aria = (row.get_attribute("aria-label") or "").strip()
-                reacted = re.match(r"^(.+?)\s+reacted\s+with\b", aria, re.I)
-                if reacted:
-                    add_sender(reacted.group(1).strip())
+                else:
+                    if not find_all(row, S["rxn_name"]):
+                        for sp in find_all(row, 'span[title], span[dir="auto"]'):
+                            n = (sp.get_attribute("title") or sp.text or "").strip()
+                            if n and add_reactor(n, phone):
+                                break
+                    elif phone:
+                        add_reactor("", phone)
 
             try:
                 prev = self.driver.execute_script(
@@ -417,7 +452,7 @@ class ReactionExtractor:
             except StaleElementReferenceException:
                 continue
 
-    def _collect_senders_for_emoji(self, row_el, emoji: str) -> List[str]:
+    def _collect_senders_for_emoji(self, row_el, emoji: str) -> List[Contact]:
         target = self._find_pill(row_el, emoji) or self._find_click_target(
             row_el, emoji
         )
@@ -480,11 +515,16 @@ class ReactionExtractor:
                         count=int(
                             item.get("count", len(item.get("senders", [])))
                         ),
-                        senders=[
-                            str(s).strip()
-                            for s in item.get("senders", [])
-                            if str(s).strip()
-                        ],
+                        senders=dedupe_contacts(
+                            [
+                                r
+                                for r in (
+                                    parse_contact(s)
+                                    for s in item.get("senders", [])
+                                )
+                                if r is not None
+                            ]
+                        ),
                     )
                     for item in grouped_raw
                     if item.get("emoji")
