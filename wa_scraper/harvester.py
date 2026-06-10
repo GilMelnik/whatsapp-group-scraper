@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date
 from typing import Dict, List, Tuple
 
 from selenium.common.exceptions import StaleElementReferenceException
@@ -11,7 +11,12 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from wa_scraper.extraction.message import MessageExtractor
-from wa_scraper.localization import normalize_date_impl
+from wa_scraper.js.scroll import (
+    _JS_CHAT_ITEMS,
+    _JS_DATE_FOR_ROW,
+    _JS_DISCOVER_DATE,
+)
+from wa_scraper.localization import is_date_label, normalize_date_impl
 from wa_scraper.models import Message
 from wa_scraper.scroll.panel import PanelScroller
 from wa_scraper.selectors import CHAT_ITEM_SELECTOR, S
@@ -33,12 +38,91 @@ class MessageHarvester:
         self.max_top_scrolls = max_top_scrolls
         self.max_down_passes = max_down_passes
         self._extractor = MessageExtractor(driver)
+        self._date_fallback_warned = False
+        self._dates_logged = False
 
     def _panel_items(self, panel):
         try:
             return panel.find_elements(By.CSS_SELECTOR, CHAT_ITEM_SELECTOR)
         except StaleElementReferenceException:
             return []
+
+    def _visible_chat_items(self, panel) -> list:
+        try:
+            result = self.driver.execute_script(_JS_CHAT_ITEMS, panel)
+            if isinstance(result, list):
+                return result
+        except Exception:
+            pass
+        return []
+
+    def _normalize_date(self, raw: str) -> str:
+        raw = raw.strip()
+        if not raw or not is_date_label(raw):
+            return ""
+        return normalize_date_impl(raw)
+
+    def _discover_date(self, panel) -> str:
+        try:
+            raw = self.driver.execute_script(_JS_DISCOVER_DATE, panel, 8)
+            if isinstance(raw, str) and raw.strip():
+                return self._normalize_date(raw)
+        except Exception:
+            pass
+        return ""
+
+    def _date_for_row(self, panel, row_el) -> str:
+        try:
+            raw = self.driver.execute_script(_JS_DATE_FOR_ROW, panel, row_el)
+            if isinstance(raw, str) and raw.strip():
+                return self._normalize_date(raw)
+        except Exception:
+            pass
+        return ""
+
+    def _resolve_date(self, panel, row_el, current_date: str) -> str:
+        row_date = self._date_for_row(panel, row_el)
+        if row_date:
+            return row_date
+
+        if current_date:
+            return current_date
+
+        discovered = self._discover_date(panel)
+        if discovered:
+            return discovered
+
+        if not self._date_fallback_warned:
+            log(
+                "  ⚠  No in-chat date separator found yet;"
+                " using today until one appears."
+            )
+            self._date_fallback_warned = True
+        return date.today().strftime("%d/%m/%Y")
+
+    def _ordered_panel_rows(self, panel) -> List:
+        rows: List = []
+        seen: set = set()
+
+        for item in self._panel_items(panel):
+            try:
+                testid = item.get_attribute("data-testid") or ""
+                if testid == "msg-container":
+                    row_el = item
+                elif item.get_attribute("data-id"):
+                    row_el = find(item, S["message_row"]) or item
+                else:
+                    continue
+
+                mid = self._extractor.message_id(row_el)
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                rows.append(row_el)
+            except StaleElementReferenceException:
+                continue
+
+        return rows
 
     def harvest_visible(
         self,
@@ -47,28 +131,80 @@ class MessageHarvester:
         current_date: str,
     ) -> Tuple[int, str]:
         added = 0
+        items = self._visible_chat_items(panel)
+        items.sort(key=lambda item: item.get("top", 0))
+
+        date_items = [
+            i for i in items
+            if i.get("kind") == "date"
+            and self._normalize_date((i.get("text") or "").strip())
+        ]
+        if date_items and not self._dates_logged:
+            labels = ", ".join(
+                self._normalize_date((i.get("text") or "").strip())
+                for i in date_items[:5]
+            )
+            log(f"  ✓  Date separators in view: {labels}")
+            self._dates_logged = True
+
+        has_message_items = any(item.get("kind") == "message" for item in items)
+
+        if has_message_items:
+            for item in items:
+                try:
+                    kind = item.get("kind")
+                    if kind == "date":
+                        raw = (item.get("text") or "").strip()
+                        normalized = self._normalize_date(raw)
+                        if normalized:
+                            current_date = normalized
+                        continue
+
+                    if kind != "message":
+                        continue
+
+                    row_el = item.get("el")
+                    if not row_el:
+                        continue
+
+                    msg_date = self._resolve_date(panel, row_el, current_date)
+                    msg = self._extractor.parse(row_el, msg_date)
+                    if not msg:
+                        continue
+                    existing = messages.get(msg.id)
+                    if existing is None:
+                        messages[msg.id] = msg
+                        added += 1
+                    elif existing.date != msg.date:
+                        messages[msg.id] = msg
+                    current_date = msg_date
+
+                except StaleElementReferenceException:
+                    continue
+            return added, current_date
 
         for item in self._panel_items(panel):
             try:
-                testid = item.get_attribute("data-testid") or ""
-                if testid == "msg-dateseparator":
-                    raw = item.text.strip()
-                    if raw:
-                        current_date = normalize_date_impl(raw)
-                    continue
+                if (item.get_attribute("data-testid") or "") == "msg-dateseparator":
+                    normalized = self._normalize_date(item.text.strip())
+                    if normalized:
+                        current_date = normalized
+            except StaleElementReferenceException:
+                continue
 
-                if testid == "msg-container":
-                    row_el = item
-                elif item.get_attribute("data-id"):
-                    row_el = find(item, S["message_row"]) or item
-                else:
+        for row_el in self._ordered_panel_rows(panel):
+            try:
+                msg_date = self._resolve_date(panel, row_el, current_date)
+                msg = self._extractor.parse(row_el, msg_date)
+                if not msg:
                     continue
-
-                msg = self._extractor.parse(row_el, current_date)
-                if msg and msg.id not in messages:
+                existing = messages.get(msg.id)
+                if existing is None:
                     messages[msg.id] = msg
                     added += 1
-
+                elif existing.date != msg.date:
+                    messages[msg.id] = msg
+                current_date = msg_date
             except StaleElementReferenceException:
                 continue
 
@@ -95,7 +231,7 @@ class MessageHarvester:
         jitter(0.8, 1.4)
 
         messages: Dict[str, Message] = {}
-        current_date = datetime.today().strftime("%d/%m/%Y")
+        current_date = self._discover_date(panel)
         no_new_streak = 0
         step_n = 0
         stall_streak = 0
@@ -104,6 +240,25 @@ class MessageHarvester:
         while step_n < self.max_down_passes:
             step_n += 1
             scroller.wait_no_spinner()
+            added = 0
+
+            if not rewind_ok:
+                up_metrics = scroller.metrics()
+                for _ in range(8):
+                    scroller.wait_no_spinner()
+                    up_result = scroller.scroll("up")
+                    if up_result.get("stuck"):
+                        scroller.scroll_fallback("up")
+                    up_metrics = scroller.metrics()
+                    if PanelScroller.rewind_near_top(up_metrics):
+                        rewind_ok = True
+                        break
+                    jitter(self.scroll_pause * 0.1, self.scroll_pause * 0.2)
+                if step_n == 1 or step_n % 10 == 0 or rewind_ok:
+                    log(
+                        "  ↑  loading history"
+                        f" (logicalTop={up_metrics.get('scrollTop', 0)}) …"
+                    )
 
             try:
                 added, current_date = self.harvest_visible(
@@ -138,22 +293,6 @@ class MessageHarvester:
                 break
 
             if not rewind_ok:
-                up_metrics = metrics
-                for _ in range(8):
-                    scroller.wait_no_spinner()
-                    up_result = scroller.scroll("up")
-                    if up_result.get("stuck"):
-                        scroller.scroll_fallback("up")
-                    up_metrics = scroller.metrics()
-                    if PanelScroller.rewind_near_top(up_metrics):
-                        rewind_ok = True
-                        break
-                    jitter(self.scroll_pause * 0.1, self.scroll_pause * 0.2)
-                if step_n == 1 or step_n % 10 == 0 or rewind_ok:
-                    log(
-                        "  ↑  loading history"
-                        f" (logicalTop={up_metrics.get('scrollTop', 0)}) …"
-                    )
                 no_new_streak = 0
                 stall_streak = 0
                 continue

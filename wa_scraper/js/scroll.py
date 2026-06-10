@@ -240,3 +240,349 @@ return (function(panel, direction, overlap) {
 """
 )
 
+_JS_DATE_HELPERS = r"""
+function _waCleanDateText(text) {
+    return (text || '')
+        .replace(/[\u200e\u200f\u202a-\u202e]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+function _waIsSystemChatNotification(text) {
+    var lc = (text || '').toLowerCase();
+    var patterns = [
+        /\+\d[\d\s\-()]{6,}\d/,
+        /(?<!\d)\d[\d\s\-()]{7,}\d(?!\d)/,
+        /\badded\b/, /\bwas added\b/, /\bwere added\b/,
+        /\bjoined\b/, /\binvite link\b/,
+        /\bremoved\b/, /\bwas removed\b/,
+        /\bturned on\b/, /\bturned off\b/,
+        /\bdisappearing messages\b/,
+        /\badmin\b/, /\badmins\b/,
+        /\brecalled\b/, /\bdeleted\b/,
+        /\bleft\b/, /\bcreated\b/,
+        /\bchanged\b/, /\bsecurity code\b/,
+        /\bforwarded\b/
+    ];
+    for (var i = 0; i < patterns.length; i++) {
+        if (patterns[i].test(text) || patterns[i].test(lc)) return true;
+    }
+    return false;
+}
+function _waLooksLikeNumericDate(text) {
+    var m = text.match(/^(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?$/);
+    if (!m) return false;
+    var day = parseInt(m[1], 10);
+    var mon = parseInt(m[2], 10);
+    if (day < 1 || day > 31 || mon < 1 || mon > 12) return false;
+    if (m[3]) {
+        var year = parseInt(m[3], 10);
+        if (m[3].length === 2) return year >= 0 && year <= 99;
+        return year >= 2000 && year <= 2100;
+    }
+    return true;
+}
+function _waLooksLikeDateLabel(text) {
+    text = _waCleanDateText(text);
+    if (!text || text.length > 35) return false;
+    if (/\n/.test(text)) return false;
+    if (/^\d{1,2}:\d{2}/.test(text)) return false;
+    if (_waIsSystemChatNotification(text)) return false;
+
+    var lc = text.toLowerCase();
+    if (lc === 'today' || lc === 'yesterday') return true;
+
+    var enDays = [
+        'monday', 'tuesday', 'wednesday', 'thursday',
+        'friday', 'saturday', 'sunday'
+    ];
+    if (enDays.indexOf(lc) >= 0) return true;
+
+    var heDays = [
+        'היום', 'אתמול',
+        'ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'
+    ];
+    if (heDays.indexOf(text) >= 0) return true;
+
+    if (_waLooksLikeNumericDate(text)) return true;
+    if (/^\d{1,2}\s+\S+\s+\d{4}$/.test(text)) return true;
+    if (/^[A-Za-z\u0590-\u05FF]+\s+\d{1,2},?\s+\d{4}$/.test(text)) return true;
+
+    return false;
+}
+function _waElPlainText(el) {
+    if (!el) return '';
+    return _waCleanDateText(el.innerText || el.textContent || '');
+}
+function _waDateLabelFromEl(el) {
+    if (!el) return '';
+    if (el.getAttribute('data-testid') === 'msg-dateseparator') {
+        return _waElPlainText(el);
+    }
+
+    var best = '';
+    var spans = el.querySelectorAll('span');
+    for (var i = 0; i < spans.length; i++) {
+        var spanText = _waElPlainText(spans[i]);
+        if (!_waLooksLikeDateLabel(spanText)) continue;
+        if (!best || spanText.length < best.length) best = spanText;
+    }
+    if (best) return best;
+
+    var raw = _waElPlainText(el);
+    if (_waLooksLikeDateLabel(raw)) return raw;
+    return '';
+}
+function _waHasFixedAncestor(el, panel) {
+    var node = el;
+    while (node && node !== panel && node !== document.body) {
+        var pos = window.getComputedStyle(node).position;
+        if (pos === 'fixed') return true;
+        node = node.parentElement;
+    }
+    return false;
+}
+function _waIsInsideMessage(el) {
+    return !!el.closest(
+        'div.focusable-list-item[data-id], [data-testid="msg-container"], [data-testid="msg-meta"]'
+    );
+}
+function _waMessageRowFromEl(el) {
+    if (!el || el.nodeType !== 1) return null;
+    if (el.getAttribute('data-testid') === 'msg-container') return el;
+    if (el.classList.contains('focusable-list-item') && el.getAttribute('data-id')) return el;
+
+    var nested = el.querySelector('[data-testid="msg-container"]')
+        || el.querySelector('div.focusable-list-item[data-id]');
+    return nested || null;
+}
+function _waFindMessageList(panel) {
+    var scrollEl = _waFindScrollEl(panel);
+    var sample = panel.querySelector('div.focusable-list-item[data-id]');
+    if (!sample) return scrollEl;
+
+    var best = scrollEl;
+    var bestScore = -1;
+    var node = sample.parentElement;
+    while (node && node !== panel) {
+        var kids = node.children;
+        if (kids.length >= 2) {
+            var msgKids = 0;
+            var dateKids = 0;
+            for (var i = 0; i < kids.length; i++) {
+                if (_waMessageRowFromEl(kids[i])) msgKids++;
+                else if (_waDateLabelFromEl(kids[i])) dateKids++;
+            }
+            var score = msgKids * 20 + dateKids * 40 + kids.length;
+            if (score > bestScore) {
+                bestScore = score;
+                best = node;
+            }
+        }
+        node = node.parentElement;
+    }
+    return best;
+}
+function _waListChildren(listRoot) {
+    var children = [];
+    for (var i = 0; i < listRoot.children.length; i++) {
+        children.push(listRoot.children[i]);
+    }
+    return children;
+}
+function _waVisibleInPanel(el, panelRect) {
+    var rect = el.getBoundingClientRect();
+    return rect.bottom > panelRect.top + 1 && rect.top < panelRect.bottom - 1;
+}
+function _waDateSeparatorCandidates(panel) {
+    var candidates = [];
+    var seenTops = [];
+
+    function addCandidate(el, text) {
+        text = _waCleanDateText(text);
+        if (!text || !el || !_waLooksLikeDateLabel(text)) return;
+        if (_waIsInsideMessage(el)) return;
+        if (_waHasFixedAncestor(el, panel)) return;
+        if (el.querySelector('div.focusable-list-item[data-id], [data-testid="msg-container"]')) {
+            return;
+        }
+
+        var rect = el.getBoundingClientRect();
+        if (rect.height > 160 || rect.width < 16) return;
+
+        for (var s = 0; s < seenTops.length; s++) {
+            if (Math.abs(seenTops[s] - rect.top) < 6) return;
+        }
+        seenTops.push(rect.top);
+        candidates.push({ text: text, top: rect.top, el: el });
+    }
+
+    var legacy = panel.querySelectorAll('[data-testid="msg-dateseparator"]');
+    for (var l = 0; l < legacy.length; l++) {
+        addCandidate(legacy[l], _waDateLabelFromEl(legacy[l]));
+    }
+
+    var tabDivs = panel.querySelectorAll('div[tabindex="-1"]');
+    for (var t = 0; t < tabDivs.length; t++) {
+        var tab = tabDivs[t];
+        if (tab.querySelector('div.focusable-list-item[data-id], [data-testid="msg-container"]')) {
+            continue;
+        }
+        if (tab.querySelector('a[href]')) continue;
+        addCandidate(tab, _waDateLabelFromEl(tab));
+    }
+
+    var listRoot = _waFindMessageList(panel);
+    var children = _waListChildren(listRoot);
+    for (var c = 0; c < children.length; c++) {
+        var child = children[c];
+        if (_waMessageRowFromEl(child)) continue;
+        addCandidate(child, _waDateLabelFromEl(child));
+    }
+
+    candidates.sort(function(a, b) { return a.top - b.top; });
+    return candidates;
+}
+function _waDateForRow(panel, rowEl) {
+    var listItem = rowEl.closest('div.focusable-list-item[data-id]') || rowEl;
+    var rowTop = listItem.getBoundingClientRect().top;
+    var candidates = _waDateSeparatorCandidates(panel);
+    var best = '';
+    var bestTop = -Infinity;
+
+    for (var i = 0; i < candidates.length; i++) {
+        var cand = candidates[i];
+        if (cand.top <= rowTop + 10 && cand.top > bestTop) {
+            bestTop = cand.top;
+            best = cand.text;
+        }
+    }
+    return best;
+}
+function _waRowTop(row, panelRect) {
+    var listItem = row.closest('div.focusable-list-item[data-id]') || row;
+    return listItem.getBoundingClientRect().top;
+}
+function _waRowKey(row) {
+    var listItem = row.closest('div.focusable-list-item[data-id]');
+    if (listItem) {
+        return listItem.getAttribute('data-id') || '';
+    }
+    return row.getAttribute('data-id') || '';
+}
+function _waVisibleMessageRows(panel) {
+    var panelRect = panel.getBoundingClientRect();
+    var rows = panel.querySelectorAll(
+        'div.focusable-list-item[data-id], [data-testid="msg-container"]'
+    );
+    var seen = {};
+    var items = [];
+
+    for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        if (!_waVisibleInPanel(row, panelRect)) continue;
+
+        var key = _waRowKey(row);
+        if (!key || seen[key]) continue;
+        seen[key] = true;
+
+        var listItem = row.closest('div.focusable-list-item[data-id]');
+        var el = listItem || row;
+        items.push({
+            kind: 'message',
+            top: _waRowTop(row, panelRect),
+            el: el
+        });
+    }
+    return items;
+}
+function _waVisibleDateSeparators(panel) {
+    var panelRect = panel.getBoundingClientRect();
+    var all = _waDateSeparatorCandidates(panel);
+    var items = [];
+
+    for (var i = 0; i < all.length; i++) {
+        if (!_waVisibleInPanel(all[i].el, panelRect)) continue;
+        items.push({
+            kind: 'date',
+            text: all[i].text,
+            top: all[i].top
+        });
+    }
+    return items;
+}
+function _waFindDateAbove(panel) {
+    var panelRect = panel.getBoundingClientRect();
+    var candidates = _waDateSeparatorCandidates(panel);
+    var firstMsgTop = Infinity;
+
+    var rows = panel.querySelectorAll('div.focusable-list-item[data-id]');
+    for (var i = 0; i < rows.length; i++) {
+        if (!_waVisibleInPanel(rows[i], panelRect)) continue;
+        var top = rows[i].getBoundingClientRect().top;
+        if (top < firstMsgTop) firstMsgTop = top;
+    }
+
+    var best = '';
+    var bestTop = -Infinity;
+    for (var c = 0; c < candidates.length; c++) {
+        if (firstMsgTop < Infinity && candidates[c].top > firstMsgTop + 10) continue;
+        if (candidates[c].top > bestTop) {
+            bestTop = candidates[c].top;
+            best = candidates[c].text;
+        }
+    }
+    return best;
+}
+"""
+
+_JS_CHAT_ITEMS = (
+    _JS_SCROLL_HELPERS
+    + _JS_DATE_HELPERS
+    + r"""
+return (function(panel) {
+    var items = _waVisibleDateSeparators(panel).concat(_waVisibleMessageRows(panel));
+    items.sort(function(a, b) { return a.top - b.top; });
+    return items;
+})(arguments[0]);
+"""
+)
+
+_JS_DISCOVER_DATE = (
+    _JS_SCROLL_HELPERS
+    + _JS_DATE_HELPERS
+    + r"""
+return (function(panel, maxAttempts) {
+    maxAttempts = maxAttempts || 8;
+    var scrollEl = _waFindScrollEl(panel);
+    var reversed = _waIsReversed(scrollEl);
+
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+        var text = _waFindDateAbove(panel);
+        if (text) return text;
+
+        if (_waAtTop(scrollEl, reversed)) break;
+
+        var delta = 180;
+        var targets = [scrollEl];
+        if (panel !== scrollEl) targets.push(panel);
+        for (var i = 0; i < targets.length; i++) {
+            targets[i].scrollTop -= delta;
+            _waDispatchWheel(targets[i], -delta);
+        }
+    }
+
+    return _waFindDateAbove(panel);
+})(arguments[0], arguments[1]);
+"""
+)
+
+_JS_DATE_FOR_ROW = (
+    _JS_SCROLL_HELPERS
+    + _JS_DATE_HELPERS
+    + r"""
+return (function(panel, rowEl) {
+    return _waDateForRow(panel, rowEl);
+})(arguments[0], arguments[1]);
+"""
+)
+

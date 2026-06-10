@@ -36,6 +36,70 @@ _HE_MONTHS: Dict[str, int] = {
 
 
 
+_SYSTEM_DATE_PATTERNS = (
+    re.compile(r"\+\d[\d\s\-()]{6,}\d"),
+    re.compile(r"(?<!\d)\d[\d\s\-()]{7,}\d(?!\d)"),
+    re.compile(r"\badded\b", re.I),
+    re.compile(r"\bwas added\b", re.I),
+    re.compile(r"\bwere added\b", re.I),
+    re.compile(r"\bjoined\b", re.I),
+    re.compile(r"\binvite link\b", re.I),
+    re.compile(r"\bremoved\b", re.I),
+    re.compile(r"\bwas removed\b", re.I),
+    re.compile(r"\bturned on\b", re.I),
+    re.compile(r"\bturned off\b", re.I),
+    re.compile(r"\bdisappearing messages\b", re.I),
+    re.compile(r"\badmins?\b", re.I),
+    re.compile(r"\brecalled\b", re.I),
+    re.compile(r"\bdeleted\b", re.I),
+    re.compile(r"\bleft\b", re.I),
+    re.compile(r"\bcreated\b", re.I),
+    re.compile(r"\bchanged\b", re.I),
+    re.compile(r"\bsecurity code\b", re.I),
+    re.compile(r"\bforwarded\b", re.I),
+)
+
+
+def is_date_label(raw: str) -> bool:
+    """Return True only for WhatsApp in-chat day/date separator labels."""
+    s = raw.strip()
+    if not s or len(s) > 35 or "\n" in s:
+        return False
+    if re.match(r"^\d{1,2}:\d{2}", s):
+        return False
+    for pat in _SYSTEM_DATE_PATTERNS:
+        if pat.search(s):
+            return False
+
+    lc = s.lower()
+    if lc in ("today", "yesterday"):
+        return True
+
+    if lc in (
+        "monday", "tuesday", "wednesday", "thursday",
+        "friday", "saturday", "sunday",
+    ):
+        return True
+
+    if s in ("היום", "אתמול", *_HE_WEEKDAYS.keys()):
+        return True
+
+    m = re.match(r"^(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?$", s)
+    if m:
+        day, mon = int(m.group(1)), int(m.group(2))
+        if 1 <= day <= 31 and 1 <= mon <= 12:
+            return True
+        return False
+
+    if re.match(r"^\d{1,2}\s+\S+\s+\d{4}$", s):
+        return True
+
+    if re.match(r"^[A-Za-z\u0590-\u05FF]+\s+\d{1,2},?\s+\d{4}$", s):
+        return True
+
+    return False
+
+
 def normalize_date_impl(raw: str) -> str:
     """
     Convert WhatsApp date-separator labels to dd/mm/yyyy.
@@ -49,7 +113,10 @@ def normalize_date_impl(raw: str) -> str:
         "ראשון"…"שבת" → most-recent matching weekday
         "15 בינואר 2025" or "15 ינואר 2025" → dd/mm/yyyy
     """
-    s     = raw.strip()
+    s = raw.strip()
+    if not is_date_label(s):
+        return ""
+
     today = date.today()
     lc    = s.lower()
 
@@ -98,10 +165,11 @@ def normalize_date_impl(raw: str) -> str:
         "%d %b %Y",   # 15 Mar 2025
         "%d/%m/%Y",   # 15/03/2025
         "%m/%d/%Y",   # 03/15/2025
+        "%d.%m.%Y",   # 15.03.2025
     ):
         try:
             return datetime.strptime(s, fmt).strftime("%d/%m/%Y")
         except ValueError:
             pass
 
-    return s  # return verbatim if nothing matched
+    return ""
