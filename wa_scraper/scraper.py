@@ -22,6 +22,7 @@ class ScraperConfig:
     profile_dir: Optional[str] = None
     scroll_pause: float = 1.0
     max_top_scrolls: int = 6000
+    scroll_to_chat_start: bool = False
 
 
 class WhatsAppScraper:
@@ -46,6 +47,7 @@ class WhatsAppScraper:
                 driver,
                 scroll_pause=self.config.scroll_pause,
                 max_top_scrolls=self.config.max_top_scrolls,
+                scroll_to_chat_start=self.config.scroll_to_chat_start,
             )
             return harvester.scrape()
         finally:

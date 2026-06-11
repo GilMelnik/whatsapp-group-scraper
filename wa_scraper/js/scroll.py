@@ -828,3 +828,66 @@ return (function(panel) {
 """
 )
 
+_JS_OLDER_MESSAGES_HELPERS = r"""
+function _waOlderMessagesPatterns() {
+    return [
+        /click here to get older messages/i,
+        /use whatsapp on your phone to see older/i,
+        /get older messages from your phone/i,
+        /older messages from your phone/i,
+        /לחצו כאן כדי לקבל/i,
+        /הודעות ישנות יותר/i,
+        /הודעות צ'אט ישנות/i
+    ];
+}
+function _waOlderMessagesButton(panel) {
+    if (!panel) return null;
+    var patterns = _waOlderMessagesPatterns();
+    var candidates = panel.querySelectorAll('button');
+    for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i];
+        var text = (el.innerText || el.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (!text) continue;
+        for (var p = 0; p < patterns.length; p++) {
+            if (patterns[p].test(text)) return el;
+        }
+    }
+    return null;
+}
+"""
+
+_JS_HAS_OLDER_MESSAGES_PROMPT = (
+    _JS_OLDER_MESSAGES_HELPERS
+    + r"""
+return !!_waOlderMessagesButton(arguments[0]);
+"""
+)
+
+_JS_CLICK_OLDER_MESSAGES_PROMPT = (
+    _JS_OLDER_MESSAGES_HELPERS
+    + r"""
+return (function(panel) {
+    var btn = _waOlderMessagesButton(panel);
+    if (!btn) return false;
+    try {
+        btn.scrollIntoView({block: 'center', inline: 'nearest'});
+    } catch (e) {}
+    try {
+        btn.click();
+        return true;
+    } catch (e) {}
+    try {
+        btn.dispatchEvent(new MouseEvent('click', {
+            bubbles: true,
+            cancelable: true,
+            view: window
+        }));
+        return true;
+    } catch (e2) {}
+    return false;
+})(arguments[0]);
+"""
+)
+

@@ -32,10 +32,12 @@ class MessageHarvester:
         driver,
         scroll_pause: float = 1.0,
         max_top_scrolls: int = 6000,
+        scroll_to_chat_start: bool = False,
     ) -> None:
         self.driver = driver
         self.scroll_pause = scroll_pause
         self.max_top_scrolls = max_top_scrolls
+        self.scroll_to_chat_start = scroll_to_chat_start
         self._extractor = MessageExtractor(driver)
         self._dates_logged = False
 
@@ -119,6 +121,18 @@ class MessageHarvester:
             jitter(0.15, 0.35)
 
         return self._find_date_above(panel) or current_date
+
+    def _try_load_older_from_phone(self, panel, scroller) -> bool:
+        """Click WhatsApp's phone-sync prompt and wait for older messages."""
+        if not self.scroll_to_chat_start:
+            return False
+        if not scroller.click_older_messages_prompt():
+            return False
+
+        log("  ↻  Clicked 'load older messages from phone' — waiting …")
+        scroller.wait_no_spinner(timeout=45.0)
+        jitter(0.8, 1.6)
+        return True
 
     def _ordered_panel_rows(self, panel) -> List:
         rows: List = []
@@ -306,7 +320,10 @@ class MessageHarvester:
         except Exception:
             pass
 
-        log("↑  Harvesting from newest messages upward …")
+        if self.scroll_to_chat_start:
+            log("↑  Harvesting upward to the start of the chat (phone sync enabled) …")
+        else:
+            log("↑  Harvesting from newest messages upward …")
         jitter(0.8, 1.4)
 
         messages: Dict[str, Message] = {}
@@ -321,6 +338,12 @@ class MessageHarvester:
 
         for step_n in range(1, self.max_top_scrolls + 1):
             scroller.wait_no_spinner()
+            if self._try_load_older_from_phone(panel, scroller):
+                no_new_streak = 0
+                stall_streak = 0
+                scroll_stuck_streak = 0
+                prev_oldest_id = ""
+                stagnant_steps = 0
             current_date = self._ensure_date_context(panel, scroller, current_date)
 
             try:
@@ -357,12 +380,18 @@ class MessageHarvester:
                     f" (+{added} new), visible={visible_n}{anchor_hint}"
                 )
 
+            older_prompt = (
+                scroller.has_older_messages_prompt()
+                if self.scroll_to_chat_start
+                else False
+            )
             if PanelScroller.reached_history_top(
                 metrics,
                 stall_streak=stall_streak,
                 scroll_stuck_streak=scroll_stuck_streak,
                 no_new_streak=no_new_streak,
                 prev_oldest_id=prev_oldest_id,
+                has_older_messages_prompt=older_prompt,
             ):
                 current_date = self._ensure_date_context(
                     panel, scroller, current_date

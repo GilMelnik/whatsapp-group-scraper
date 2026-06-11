@@ -66,6 +66,7 @@ Usage
   python whatsapp_scraper.py --group "My Group"
   python whatsapp_scraper.py --group "Team Chat" --output team.json
   python whatsapp_scraper.py --group "Team Chat" --scroll-pause 1.5
+  python whatsapp_scraper.py --group "Team Chat" --scroll-to-chat-start
 
 Notes
 ─────
@@ -78,6 +79,9 @@ Notes
   • Reactor names are collected by opening the reactions drawer.
   • Scrolling harvests from the newest messages upward, anchored on the last
     scraped row so rows are not skipped.
+  • Use --scroll-to-chat-start to reach the very beginning of a chat; the
+    scraper clicks WhatsApp's "load older messages from your phone" card when
+    it appears and keeps harvesting after the sync finishes.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -115,6 +119,14 @@ def main() -> None:
         default=6000,
         help="Max upward scroll steps while harvesting history (default: 6000).",
     )
+    ap.add_argument(
+        "--scroll-to-chat-start",
+        action="store_true",
+        help=(
+            "Keep scrolling to the very start of the chat. Clicks WhatsApp's "
+            "'load older messages from your phone' prompt when it appears."
+        ),
+    )
     args = ap.parse_args()
 
     try:
@@ -128,6 +140,7 @@ def main() -> None:
         profile_dir=args.profile_dir,
         scroll_pause=args.scroll_pause,
         max_top_scrolls=args.max_top_scrolls,
+        scroll_to_chat_start=args.scroll_to_chat_start,
     )
 
     scraper = WhatsAppScraper(config)

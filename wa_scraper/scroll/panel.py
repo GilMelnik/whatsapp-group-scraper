@@ -7,6 +7,8 @@ import time
 from selenium.common.exceptions import StaleElementReferenceException
 
 from wa_scraper.js.scroll import (
+    _JS_CLICK_OLDER_MESSAGES_PROMPT,
+    _JS_HAS_OLDER_MESSAGES_PROMPT,
     _JS_PANEL_METRICS,
     _JS_PANEL_SCROLL,
     _JS_PANEL_SCROLL_UP,
@@ -29,6 +31,26 @@ class PanelScroller:
             if not find(self.panel, S["loading_spin"]):
                 return
             time.sleep(0.3)
+
+    def has_older_messages_prompt(self) -> bool:
+        try:
+            return bool(
+                self.driver.execute_script(
+                    _JS_HAS_OLDER_MESSAGES_PROMPT, self.panel
+                )
+            )
+        except Exception:
+            return False
+
+    def click_older_messages_prompt(self) -> bool:
+        try:
+            return bool(
+                self.driver.execute_script(
+                    _JS_CLICK_OLDER_MESSAGES_PROMPT, self.panel
+                )
+            )
+        except Exception:
+            return False
 
     def metrics(self) -> dict:
         try:
@@ -137,7 +159,11 @@ class PanelScroller:
         scroll_stuck_streak: int,
         no_new_streak: int,
         prev_oldest_id: str,
+        has_older_messages_prompt: bool = False,
     ) -> bool:
+        if has_older_messages_prompt:
+            return False
+
         oldest_id = metrics.get("oldestId") or ""
 
         if not oldest_id or oldest_id != prev_oldest_id:
