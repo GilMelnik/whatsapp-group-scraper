@@ -37,7 +37,10 @@ Output format  (wa_chat.json):
           { "user_name": "Carol", "phone": "+1 555-0100" }
         ] }
     ],
-    "media_type": null
+    "media_type": null,
+    "is_forwarded": false,
+    "is_deleted": false,
+    "link_preview": null
   },
   ...
 ]
@@ -48,14 +51,20 @@ Captured fields
                    ("You" for outgoing messages; phone-only when unsaved)
   • date         – calendar date from the chat's date-separator cards
   • time         – HH:MM (or H:MM AM/PM, matching your locale)
-  • text         – raw message text (empty for media-only messages)
+  • text         – raw message text (the caption for captioned media;
+                   empty for media-only and for deleted messages)
   • is_outgoing  – true if YOU sent the message
   • quote        – { sender: { user_name, phone }, text } or null
   • reactions    – list of { emoji, count, senders[] }
                    senders lists who reacted as { user_name, phone }
                    count is always len(senders)
   • media_type   – "image" | "video" | "audio" | "sticker" | "document"
-                   "gif" | "location" | null
+                   "gif" | "location" | null   (set even when a caption
+                   is present)
+  • is_forwarded – true if the message is a forwarded message
+  • is_deleted   – true if the message was deleted/recalled (text is empty)
+  • link_preview – { url, title, description } for an attached link
+                   preview, or null
 
 Setup
 ─────

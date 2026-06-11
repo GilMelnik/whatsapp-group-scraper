@@ -10,7 +10,6 @@ from wa_scraper.js.scroll import (
     _JS_CLICK_OLDER_MESSAGES_PROMPT,
     _JS_HAS_OLDER_MESSAGES_PROMPT,
     _JS_PANEL_METRICS,
-    _JS_PANEL_SCROLL,
     _JS_PANEL_SCROLL_UP,
     _JS_SCROLL_HELPERS,
 )
@@ -60,17 +59,6 @@ class PanelScroller:
         except Exception:
             pass
         return {}
-
-    def scroll(self, direction: str = "down", overlap: int = 28) -> dict:
-        try:
-            result = self.driver.execute_script(
-                _JS_PANEL_SCROLL, self.panel, direction, overlap
-            )
-            if isinstance(result, dict):
-                return result
-        except Exception:
-            pass
-        return {"scrolled": 0, "stuck": True, "atBottom": False, "atTop": False}
 
     def scroll_chunk(self, px: int) -> None:
         try:

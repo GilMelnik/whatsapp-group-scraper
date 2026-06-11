@@ -17,6 +17,7 @@ from wa_scraper.js.scroll import (
     _JS_FIND_DATE_ABOVE,
     _JS_TOPMOST_NEEDS_DATE,
 )
+from wa_scraper.contact import Contact
 from wa_scraper.localization import is_date_label, normalize_date_impl
 from wa_scraper.models import Message
 from wa_scraper.scroll.panel import PanelScroller
@@ -162,6 +163,43 @@ class MessageHarvester:
 
         return rows
 
+    def _ingest_row(
+        self,
+        panel,
+        row_el,
+        messages: Dict[str, Message],
+        current_date: str,
+        *,
+        separator_seen_above: bool,
+    ) -> Tuple[int, str]:
+        """Resolve a row's date and store it if new. Returns (added, current_date)."""
+        msg_date = self._resolve_date(
+            panel,
+            row_el,
+            current_date,
+            separator_seen_above=separator_seen_above,
+        )
+
+        mid = self._extractor.message_id(row_el)
+        if mid and mid in messages:
+            return 0, (msg_date or current_date)
+
+        if not msg_date:
+            return 0, current_date
+
+        msg = self._extractor.parse(row_el, msg_date)
+        if not msg:
+            return 0, current_date
+
+        existing = messages.get(msg.id)
+        added = 0
+        if existing is None:
+            messages[msg.id] = msg
+            added = 1
+        elif existing.date != msg.date:
+            messages[msg.id] = msg
+        return added, msg_date
+
     def harvest_visible(
         self,
         panel,
@@ -211,36 +249,14 @@ class MessageHarvester:
                         separator_top is not None
                         and item.get("top", 0) > separator_top + 1
                     )
-                    mid = self._extractor.message_id(row_el)
-                    if mid and mid in messages:
-                        msg_date = self._resolve_date(
-                            panel,
-                            row_el,
-                            current_date,
-                            separator_seen_above=seen_below_separator,
-                        )
-                        if msg_date:
-                            current_date = msg_date
-                        continue
-
-                    msg_date = self._resolve_date(
+                    added_delta, current_date = self._ingest_row(
                         panel,
                         row_el,
+                        messages,
                         current_date,
                         separator_seen_above=seen_below_separator,
                     )
-                    if not msg_date:
-                        continue
-                    msg = self._extractor.parse(row_el, msg_date)
-                    if not msg:
-                        continue
-                    existing = messages.get(msg.id)
-                    if existing is None:
-                        messages[msg.id] = msg
-                        added += 1
-                    elif existing.date != msg.date:
-                        messages[msg.id] = msg
-                    current_date = msg_date
+                    added += added_delta
 
                 except StaleElementReferenceException:
                     continue
@@ -259,37 +275,14 @@ class MessageHarvester:
 
         for row_el in self._ordered_panel_rows(panel):
             try:
-                seen_below_separator = separator_top is not None
-                mid = self._extractor.message_id(row_el)
-                if mid and mid in messages:
-                    msg_date = self._resolve_date(
-                        panel,
-                        row_el,
-                        current_date,
-                        separator_seen_above=seen_below_separator,
-                    )
-                    if msg_date:
-                        current_date = msg_date
-                    continue
-
-                msg_date = self._resolve_date(
+                added_delta, current_date = self._ingest_row(
                     panel,
                     row_el,
+                    messages,
                     current_date,
-                    separator_seen_above=seen_below_separator,
+                    separator_seen_above=separator_top is not None,
                 )
-                if not msg_date:
-                    continue
-                msg = self._extractor.parse(row_el, msg_date)
-                if not msg:
-                    continue
-                existing = messages.get(msg.id)
-                if existing is None:
-                    messages[msg.id] = msg
-                    added += 1
-                elif existing.date != msg.date:
-                    messages[msg.id] = msg
-                current_date = msg_date
+                added += added_delta
             except StaleElementReferenceException:
                 continue
 
@@ -306,6 +299,41 @@ class MessageHarvester:
             return (1, 0.0, msg.id)
 
         return sorted(messages.values(), key=sort_key)
+
+    @staticmethod
+    def _fill_grouped_senders(ordered: List[Message]) -> None:
+        """Inherit the sender for header-less messages in a consecutive run.
+
+        WhatsApp renders the author header (name/phone) only on the first message
+        of a consecutive run from the same sender; the following messages in the
+        run carry no author element and therefore parse with an empty sender.
+        Such a message always belongs to the same sender as the message directly
+        above it, so we carry the last known sender forward within each day.
+        """
+        last_sender: Contact | None = None
+        last_date = ""
+        for msg in ordered:
+            if msg.date != last_date:
+                last_sender = None
+                last_date = msg.date
+
+            if msg.is_outgoing:
+                # An outgoing message breaks the incoming run: the next incoming
+                # message from any sender gets its own header again.
+                last_sender = None
+                continue
+
+            sender = msg.sender
+            has_details = bool(
+                sender and (sender.user_name or sender.phone)
+            )
+            if has_details:
+                last_sender = sender
+            elif last_sender is not None:
+                msg.sender = Contact(
+                    user_name=last_sender.user_name,
+                    phone=last_sender.phone,
+                )
 
     def scrape(self) -> List[Message]:
         panel = WebDriverWait(self.driver, 30).until(
@@ -433,4 +461,6 @@ class MessageHarvester:
                 f"{len(messages)} messages captured."
             )
 
-        return self._sort_messages(messages)
+        ordered = self._sort_messages(messages)
+        self._fill_grouped_senders(ordered)
+        return ordered

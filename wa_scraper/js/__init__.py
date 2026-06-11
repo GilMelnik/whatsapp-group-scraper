@@ -22,9 +22,7 @@ from wa_scraper.js.reactions import (
 from wa_scraper.js.scroll import (
     _JS_CHAT_ITEMS,
     _JS_DATE_FOR_ROW,
-    _JS_DISCOVER_DATE,
     _JS_PANEL_METRICS,
-    _JS_PANEL_SCROLL,
     _JS_PANEL_SCROLL_UP,
     _JS_SCROLL_HELPERS,
 )

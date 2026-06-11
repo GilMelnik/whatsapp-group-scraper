@@ -21,6 +21,10 @@ _JS_SKIP_ZONES = r"""[
     '[data-testid="sticker-media"]',
     '[data-testid="document-thumb"]',
     '[data-testid="location-map"]',
+    '[data-testid="recalled"]',
+    '[data-icon="recalled"]',
+    '[data-testid="forward-refreshed"]',
+    '[data-icon="forward-refreshed"]',
     '.quoted-mention',
     '.wds-icon'
 ]"""
@@ -61,7 +65,7 @@ function _waExtractBodyAfterQuote(quoteBlock) {
     for (var depth = 0; depth < 8 && anchor; depth++) {
         var sib = anchor.nextElementSibling;
         while (sib) {
-            var st = sib.querySelector('[data-testid="selectable-text"]');
+            var st = sib.querySelector('[data-testid~="selectable-text"]');
             if (st && _waIsBodyTextEl(st, quoteBlock)) {
                 var t = _waElText(st);
                 if (_waTextOk(t)) return t;
@@ -80,7 +84,7 @@ function _waExtractBodyFromAkbu(container, quoteBlock) {
     for (var i = 0; i < zones.length; i++) {
         var zone = zones[i];
         if (quoteBlock && quoteBlock.contains(zone)) continue;
-        var st = zone.querySelector('[data-testid="selectable-text"]');
+        var st = zone.querySelector('[data-testid~="selectable-text"]');
         if (st && _waIsBodyTextEl(st, quoteBlock)) {
             var t = _waElText(st);
             if (_waTextOk(t)) return t;
@@ -210,9 +214,61 @@ function _waFindQuoteAuthor(block) {
         || block.querySelector('[data-testid="author"]');
     return el ? (el.innerText || '').trim() : '';
 }
+function _waIsForwarded(container, quoteBlock) {
+    var el = container.querySelector(
+        '[data-testid="forward-refreshed"], [data-icon="forward-refreshed"]'
+    );
+    if (!el) return false;
+    if (quoteBlock && quoteBlock.contains(el)) return false;
+    return true;
+}
+function _waIsDeleted(container, quoteBlock) {
+    var el = container.querySelector(
+        '[data-testid="recalled"], [data-icon="recalled"]'
+    );
+    if (!el) return false;
+    if (quoteBlock && quoteBlock.contains(el)) return false;
+    return true;
+}
+function _waMediaType(container, quoteBlock) {
+    var checks = [
+        ['image', '[data-testid="image-thumb"], [data-testid="media-url-provider"]'],
+        ['video', '[data-testid="video-thumb"]'],
+        ['audio', '[data-testid="audio-player"]'],
+        ['sticker', '[data-testid="sticker-media"]'],
+        ['document', '[data-testid="document-thumb"]'],
+        ['gif', '[data-testid="gif-thumb"], [data-testid="image-thumb-gif"]'],
+        ['location', '[data-testid="location-map"]']
+    ];
+    for (var i = 0; i < checks.length; i++) {
+        var el = container.querySelector(checks[i][1]);
+        if (el && !(quoteBlock && quoteBlock.contains(el))) {
+            return checks[i][0];
+        }
+    }
+    return null;
+}
+function _waLinkPreview(container, quoteBlock) {
+    var lp = container.querySelector('[data-testid="link-preview-container"]');
+    if (!lp) return null;
+    if (quoteBlock && quoteBlock.contains(lp)) return null;
+    var titleEl = lp.querySelector('[data-testid="link-preview-title"]');
+    var descEl = lp.querySelector('[data-testid^="link-description"]');
+    var title = titleEl ? _waElText(titleEl) : '';
+    var desc = descEl ? _waElText(descEl) : '';
+    var url = '';
+    var anchor = lp.querySelector('a[href]');
+    if (anchor) url = anchor.getAttribute('href') || '';
+    if (!url) {
+        var urlEl = container.querySelector('[data-testid="url-element"]');
+        if (urlEl) url = _waElText(urlEl);
+    }
+    if (!title && !desc && !url) return null;
+    return { url: url, title: title, description: desc };
+}
 function _waCollectBodyElements(root, quoteBlock, skip) {
     var results = [];
-    var els = root.querySelectorAll('[data-testid="selectable-text"]');
+    var els = root.querySelectorAll('[data-testid~="selectable-text"]');
     for (var i = 0; i < els.length; i++) {
         var el = els[i];
         if (!_waIsBodyTextEl(el, quoteBlock)) continue;
@@ -328,9 +384,11 @@ return (function(row) {
     var quoteBlock = _waFindQuoteBlock(row);
     var authorEl = container.querySelector('[testid="author"], [data-testid="author"]');
 
+    var isDeleted = _waIsDeleted(container, quoteBlock);
     var quote = quoteBlock ? _waExtractQuote(quoteBlock) : null;
     var sender = _waExtractSender(row, container, isOut, quoteBlock);
-    var text = _waExtractBody(container, quoteBlock, authorEl, SKIP);
+    // Deleted ("recalled") messages have no recoverable body; the flag carries it.
+    var text = isDeleted ? '' : _waExtractBody(container, quoteBlock, authorEl, SKIP);
     var time = _waExtractTime(container);
 
     if (!time) {
@@ -343,7 +401,11 @@ return (function(row) {
         text: text,
         time: time,
         isOutgoing: isOut,
-        quote: quote
+        quote: quote,
+        isForwarded: _waIsForwarded(container, quoteBlock),
+        isDeleted: isDeleted,
+        mediaType: isDeleted ? null : _waMediaType(container, quoteBlock),
+        linkPreview: isDeleted ? null : _waLinkPreview(container, quoteBlock)
     };
 })(arguments[0]);
 """

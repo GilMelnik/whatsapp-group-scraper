@@ -23,14 +23,24 @@ class Quote:
 
 
 @dataclass
+class LinkPreview:
+    url:         str = ""
+    title:       str = ""
+    description: str = ""
+
+
+@dataclass
 class Message:
-    id:          str
-    date:        str
-    time:        str
-    sender:      Contact
-    text:        str
-    is_outgoing: bool
-    quote:       Optional[Quote]    = None
-    reactions:   List[Reaction]     = field(default_factory=list)
-    media_type:  Optional[str]      = None
+    id:           str
+    date:         str
+    time:         str
+    sender:       Contact
+    text:         str
+    is_outgoing:  bool
+    quote:        Optional[Quote]       = None
+    reactions:    List[Reaction]        = field(default_factory=list)
+    media_type:   Optional[str]         = None
+    is_forwarded: bool                  = False
+    is_deleted:   bool                  = False
+    link_preview: Optional[LinkPreview] = None
 

@@ -19,7 +19,7 @@ from wa_scraper.js.message import (
     _JS_SENDER,
 )
 from wa_scraper.contact import Contact, parse_contact
-from wa_scraper.models import Message, Quote
+from wa_scraper.models import LinkPreview, Message, Quote
 from wa_scraper.selectors import MEDIA_CHECKS, S
 from wa_scraper.utils import find, find_all
 
@@ -224,6 +224,39 @@ class MessageExtractor:
             return None
         return Quote(sender=q_sender, text=q_text)
 
+    def _detect_media_type(self, row_el) -> Optional[str]:
+        """Selenium fallback media detection, ignoring matches inside the quote."""
+        container = find(row_el, '[data-testid="msg-container"]') or row_el
+        quote_block = self.find_quote_block(row_el)
+        for mtype, sel in MEDIA_CHECKS:
+            el = find(container, sel)
+            if not el:
+                continue
+            if quote_block is not None:
+                try:
+                    inside = self.driver.execute_script(
+                        "return arguments[0] && arguments[0].contains(arguments[1]);",
+                        quote_block,
+                        el,
+                    )
+                    if inside:
+                        continue
+                except Exception:
+                    pass
+            return mtype
+        return None
+
+    @staticmethod
+    def _build_link_preview(raw) -> Optional[LinkPreview]:
+        if not isinstance(raw, dict):
+            return None
+        url = (raw.get("url") or "").strip()
+        title = (raw.get("title") or "").strip()
+        description = (raw.get("description") or "").strip()
+        if not url and not title and not description:
+            return None
+        return LinkPreview(url=url, title=title, description=description)
+
     def parse(
         self,
         row_el,
@@ -261,29 +294,42 @@ class MessageExtractor:
                     m = re.search(r"\d{1,2}:\d{2}(?:\s?[AaPp][Mm])?", raw)
                     msg_time = m.group(0) if m else raw.split()[-1]
 
-            text = (
-                str(dom.get("text") or "").strip()
-                if dom and dom.get("text")
-                else self.extract_text(row_el)
-            )
+            is_forwarded = bool(dom.get("isForwarded")) if dom else False
+            is_deleted = bool(dom.get("isDeleted")) if dom else False
 
-            media_type = None
-            if not text:
-                for mtype, sel in MEDIA_CHECKS:
-                    if find(row_el, sel):
-                        media_type = mtype
-                        break
+            # Deleted ("recalled") messages have no recoverable body; avoid the
+            # text fallback, which would re-collect the author/notice glyphs.
+            if is_deleted:
+                text = ""
+            else:
+                text = (
+                    str(dom.get("text") or "").strip()
+                    if dom and dom.get("text")
+                    else self.extract_text(row_el)
+                )
+
+            if dom and "mediaType" in dom:
+                media_type = dom.get("mediaType")
+            else:
+                media_type = self._detect_media_type(row_el)
+
+            link_preview = (
+                self._build_link_preview(dom.get("linkPreview")) if dom else None
+            )
 
             if (
                 not sender.user_name
                 and not sender.phone
                 and not text
                 and media_type is None
+                and not is_deleted
             ):
                 return None
 
-            if media_type is None and not re.search(
-                r"\d{1,2}:\d{2}", msg_time
+            if (
+                media_type is None
+                and not is_deleted
+                and not re.search(r"\d{1,2}:\d{2}", msg_time)
             ):
                 return None
 
@@ -300,6 +346,9 @@ class MessageExtractor:
                 quote=quote,
                 reactions=reactions,
                 media_type=media_type,
+                is_forwarded=is_forwarded,
+                is_deleted=is_deleted,
+                link_preview=link_preview,
             )
 
         except StaleElementReferenceException:

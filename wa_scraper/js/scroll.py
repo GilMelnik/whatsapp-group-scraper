@@ -59,24 +59,6 @@ function _waFindScrollEl(panel) {
     }
     return best;
 }
-function _waTopmostRow(panel) {
-    var panelRect = panel.getBoundingClientRect();
-    var rows = _waQueryMessageRows(panel);
-    var topRow = null;
-    var minY = Infinity;
-    for (var i = 0; i < rows.length; i++) {
-        var el = rows[i];
-        if (!_waIsRealMessageRow(el)) continue;
-        var rect = el.getBoundingClientRect();
-        if (rect.bottom <= panelRect.top + 1) continue;
-        if (rect.top >= panelRect.bottom - 1) continue;
-        if (rect.top < minY) {
-            minY = rect.top;
-            topRow = el;
-        }
-    }
-    return topRow;
-}
 function _waDispatchWheel(scrollEl, deltaY) {
     try {
         scrollEl.dispatchEvent(new WheelEvent('wheel', {
@@ -125,9 +107,6 @@ function _waDetectReversedOnce(panel, scrollEl) {
     }
     panel.dataset.waReversed = reversed ? '1' : '0';
     return reversed;
-}
-function _waIsReversed(el) {
-    return false;
 }
 function _waMaxScroll(el) {
     return Math.max(0, el.scrollHeight - el.clientHeight);
@@ -252,65 +231,6 @@ return (function(panel) {
 """
 )
 
-_JS_PANEL_SCROLL = (
-    _JS_SCROLL_HELPERS
-    + r"""
-return (function(panel, direction, overlap) {
-    overlap = overlap || 28;
-    direction = direction || 'down';
-    var scrollEl = _waFindScrollEl(panel);
-    var reversed = _waDetectReversedOnce(panel, scrollEl);
-    var panelRect = panel.getBoundingClientRect();
-    var rows = _waQueryMessageRows(panel);
-    var prevLogical = _waLogicalTop(scrollEl, reversed);
-    var prevRaw = scrollEl.scrollTop;
-    var delta = 0;
-
-    if (direction === 'down') {
-        var maxBottom = -Infinity;
-        for (var i = 0; i < rows.length; i++) {
-            var el = rows[i];
-            var rect = el.getBoundingClientRect();
-            if (rect.bottom <= panelRect.top + 1) continue;
-            if (rect.top >= panelRect.bottom - 1) continue;
-            var relBottom = rect.bottom - panelRect.top;
-            if (relBottom > maxBottom) maxBottom = relBottom;
-        }
-        if (maxBottom > -Infinity) {
-            delta = Math.max(12, maxBottom - overlap);
-        } else {
-            delta = Math.max(48, Math.floor(scrollEl.clientHeight * 0.45));
-        }
-        _waSetLogicalTop(scrollEl, reversed, prevLogical + delta);
-    } else {
-        delta = Math.max(350, Math.floor(scrollEl.clientHeight * 0.8));
-        var topRow = _waTopmostRow(panel);
-        if (topRow) {
-            var sRect = scrollEl.getBoundingClientRect();
-            var tRect = topRow.getBoundingClientRect();
-            var offset = Math.max(0, tRect.top - sRect.top - 12);
-            delta = Math.max(delta, offset + 180);
-        }
-        _waSetLogicalTop(scrollEl, reversed, Math.max(0, prevLogical - delta));
-        _waDispatchWheel(scrollEl, reversed ? delta : -delta);
-    }
-
-    var logicalTop = _waLogicalTop(scrollEl, reversed);
-    return {
-        scrolled: logicalTop - prevLogical,
-        delta: delta,
-        scrollTop: logicalTop,
-        rawScrollTop: scrollEl.scrollTop,
-        reversed: reversed,
-        atBottom: _waAtBottom(scrollEl, reversed),
-        atTop: _waAtTop(scrollEl, reversed),
-        stuck: Math.abs(logicalTop - prevLogical) < 1
-            && Math.abs(scrollEl.scrollTop - prevRaw) < 1
-    };
-})(arguments[0], arguments[1], arguments[2]);
-"""
-)
-
 _JS_PANEL_SCROLL_UP = (
     _JS_SCROLL_HELPERS
     + r"""
@@ -320,8 +240,7 @@ return (function(panel, anchorId, overlap) {
     var reversed = _waDetectReversedOnce(panel, scrollEl);
     var prevRaw = scrollEl.scrollTop;
     var prevLogical = _waLogicalTop(scrollEl, reversed);
-    var stepSize = 64;
-    var topRow = _waTopmostRow(panel);
+    var stepSize;
     var anchorRow = null;
 
     if (anchorId) {
@@ -338,23 +257,27 @@ return (function(panel, anchorId, overlap) {
         }
     }
 
-    var scrollRow = anchorRow || topRow;
-    if (scrollRow) {
-        var tRect = scrollRow.getBoundingClientRect();
-        var rowHeight = Math.max(tRect.height, 28);
-        stepSize = Math.max(
-            24,
-            Math.min(
-                140,
-                Math.floor(rowHeight * (0.42 + Math.random() * 0.22)) + overlap
-            )
-        );
-    } else {
-        stepSize = Math.max(
-            36,
-            Math.floor(scrollEl.clientHeight * (0.12 + Math.random() * 0.1))
-        );
+    // Move close to a full viewport per step, but keep the overlap larger than
+    // the tallest currently-visible row so consecutive viewports are contiguous
+    // and no row can fall between them unharvested.
+    var clientH = scrollEl.clientHeight || 600;
+    var panelRect = panel.getBoundingClientRect();
+    var rows = _waQueryMessageRows(panel);
+    var maxVisibleRow = 0;
+    for (var i = 0; i < rows.length; i++) {
+        var rowEl = rows[i];
+        if (!_waIsRealMessageRow(rowEl)) continue;
+        var rc = rowEl.getBoundingClientRect();
+        if (rc.bottom <= panelRect.top + 1) continue;
+        if (rc.top >= panelRect.bottom - 1) continue;
+        if (rc.height > maxVisibleRow) maxVisibleRow = rc.height;
     }
+    var safeOverlap = Math.max(overlap, maxVisibleRow + 48);
+    stepSize = Math.floor(clientH * (0.6 + Math.random() * 0.12));
+    if (stepSize > clientH - safeOverlap) {
+        stepSize = clientH - safeOverlap;
+    }
+    if (stepSize < 80) stepSize = 80;
 
     var delta = stepSize;
     _waSetLogicalTop(scrollEl, reversed, Math.max(0, prevLogical - delta));
@@ -758,41 +681,6 @@ return (function(panel) {
     items.sort(function(a, b) { return a.top - b.top; });
     return items;
 })(arguments[0]);
-"""
-)
-
-_JS_DISCOVER_DATE = (
-    _JS_SCROLL_HELPERS
-    + _JS_DATE_HELPERS
-    + r"""
-return (function(panel, maxAttempts) {
-    maxAttempts = maxAttempts || 8;
-    var scrollEl = _waFindScrollEl(panel);
-    var reversed = _waDetectReversedOnce(panel, scrollEl);
-
-    for (var attempt = 0; attempt < maxAttempts; attempt++) {
-        var text = _waFindDateAbove(panel);
-        if (text) return text;
-
-        var prevLogical = _waLogicalTop(scrollEl, reversed);
-        var delta = 96 + Math.floor(Math.random() * 64);
-        _waSetLogicalTop(scrollEl, reversed, Math.max(0, prevLogical - delta));
-
-        var targets = [scrollEl];
-        if (panel !== scrollEl) targets.push(panel);
-        var wheelSign = reversed ? 1 : -1;
-        var remaining = delta;
-        while (remaining > 0) {
-            var chunk = Math.min(remaining, 12 + Math.floor(Math.random() * 20));
-            for (var i = 0; i < targets.length; i++) {
-                _waDispatchWheel(targets[i], wheelSign * chunk);
-            }
-            remaining -= chunk;
-        }
-    }
-
-    return _waFindDateAbove(panel);
-})(arguments[0], arguments[1]);
 """
 )
 
