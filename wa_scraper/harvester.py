@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Dict, List, Tuple
+from datetime import date
+from typing import Dict, List, Optional, Tuple
 
 from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.common.by import By
@@ -17,11 +17,16 @@ from wa_scraper.js.scroll import (
     _JS_FIND_DATE_ABOVE,
     _JS_TOPMOST_NEEDS_DATE,
 )
-from wa_scraper.contact import Contact
 from wa_scraper.localization import is_date_label, normalize_date_impl
 from wa_scraper.models import Message
+from wa_scraper.postprocess import (
+    fill_grouped_senders,
+    parse_chat_date,
+    sort_messages,
+)
 from wa_scraper.scroll.panel import PanelScroller
 from wa_scraper.selectors import CHAT_ITEM_SELECTOR, S
+from wa_scraper.storage import ShardWriter
 from wa_scraper.utils import find, jitter, log
 
 
@@ -34,11 +39,19 @@ class MessageHarvester:
         scroll_pause: float = 1.0,
         max_top_scrolls: int = 6000,
         scroll_to_chat_start: bool = False,
+        writer: Optional[ShardWriter] = None,
+        from_date: Optional[date] = None,
+        to_date: Optional[date] = None,
+        checkpoint_interval: int = 25,
     ) -> None:
         self.driver = driver
         self.scroll_pause = scroll_pause
         self.max_top_scrolls = max_top_scrolls
         self.scroll_to_chat_start = scroll_to_chat_start
+        self.writer = writer
+        self.from_date = from_date
+        self.to_date = to_date
+        self.checkpoint_interval = max(1, int(checkpoint_interval))
         self._extractor = MessageExtractor(driver)
         self._dates_logged = False
 
@@ -183,9 +196,18 @@ class MessageHarvester:
         mid = self._extractor.message_id(row_el)
         if mid and mid in messages:
             return 0, (msg_date or current_date)
+        if mid and self.writer is not None and self.writer.has(mid):
+            # Already persisted by this run or a prior one — skip but keep the
+            # date so the scroll loop can track where we are.
+            return 0, (msg_date or current_date)
 
         if not msg_date:
             return 0, current_date
+
+        # Date-window filter: ignore rows newer than --to-date (still scrolling
+        # down into the window) or older than --from-date (past the window).
+        if not self._date_in_window(msg_date):
+            return 0, msg_date
 
         msg = self._extractor.parse(row_el, msg_date)
         if not msg:
@@ -196,9 +218,32 @@ class MessageHarvester:
         if existing is None:
             messages[msg.id] = msg
             added = 1
+            if self.writer is not None:
+                self.writer.add(msg)
         elif existing.date != msg.date:
             messages[msg.id] = msg
         return added, msg_date
+
+    def _date_in_window(self, msg_date: str) -> bool:
+        """Whether a normalized dd/mm/yyyy date falls within the requested window."""
+        if self.from_date is None and self.to_date is None:
+            return True
+        d = parse_chat_date(msg_date)
+        if d is None:
+            # Unparseable date — keep it rather than silently dropping data.
+            return True
+        if self.to_date is not None and d > self.to_date:
+            return False
+        if self.from_date is not None and d < self.from_date:
+            return False
+        return True
+
+    def _below_from_date(self, msg_date: str) -> bool:
+        """Whether a date is strictly older than the requested --from-date."""
+        if self.from_date is None:
+            return False
+        d = parse_chat_date(msg_date)
+        return d is not None and d < self.from_date
 
     def harvest_visible(
         self,
@@ -289,51 +334,11 @@ class MessageHarvester:
         return added, current_date
 
     def _sort_messages(self, messages: Dict[str, Message]) -> List[Message]:
-        def sort_key(msg: Message):
-            for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
-                try:
-                    ts = datetime.strptime(f"{msg.date} {msg.time}", fmt).timestamp()
-                    return (0, ts, msg.id)
-                except ValueError:
-                    continue
-            return (1, 0.0, msg.id)
-
-        return sorted(messages.values(), key=sort_key)
+        return sort_messages(messages.values())
 
     @staticmethod
     def _fill_grouped_senders(ordered: List[Message]) -> None:
-        """Inherit the sender for header-less messages in a consecutive run.
-
-        WhatsApp renders the author header (name/phone) only on the first message
-        of a consecutive run from the same sender; the following messages in the
-        run carry no author element and therefore parse with an empty sender.
-        Such a message always belongs to the same sender as the message directly
-        above it, so we carry the last known sender forward within each day.
-        """
-        last_sender: Contact | None = None
-        last_date = ""
-        for msg in ordered:
-            if msg.date != last_date:
-                last_sender = None
-                last_date = msg.date
-
-            if msg.is_outgoing:
-                # An outgoing message breaks the incoming run: the next incoming
-                # message from any sender gets its own header again.
-                last_sender = None
-                continue
-
-            sender = msg.sender
-            has_details = bool(
-                sender and (sender.user_name or sender.phone)
-            )
-            if has_details:
-                last_sender = sender
-            elif last_sender is not None:
-                msg.sender = Contact(
-                    user_name=last_sender.user_name,
-                    phone=last_sender.phone,
-                )
+        fill_grouped_senders(ordered)
 
     def scrape(self) -> List[Message]:
         panel = WebDriverWait(self.driver, 30).until(
@@ -363,103 +368,129 @@ class MessageHarvester:
         anchor_id: str | None = None
         prev_message_count = 0
         stagnant_steps = 0
+        below_from_streak = 0
 
-        for step_n in range(1, self.max_top_scrolls + 1):
-            scroller.wait_no_spinner()
-            if self._try_load_older_from_phone(panel, scroller):
-                no_new_streak = 0
-                stall_streak = 0
-                scroll_stuck_streak = 0
-                prev_oldest_id = ""
-                stagnant_steps = 0
-            current_date = self._ensure_date_context(panel, scroller, current_date)
-
-            try:
-                added, current_date = self.harvest_visible(
-                    panel, messages, current_date
-                )
-            except StaleElementReferenceException:
-                panel = self.driver.find_element(By.CSS_SELECTOR, S["panel"])
-                scroller = PanelScroller(self.driver, panel)
-                added, current_date = self.harvest_visible(
-                    panel, messages, current_date
+        try:
+            for step_n in range(1, self.max_top_scrolls + 1):
+                scroller.wait_no_spinner()
+                if self._try_load_older_from_phone(panel, scroller):
+                    no_new_streak = 0
+                    stall_streak = 0
+                    scroll_stuck_streak = 0
+                    prev_oldest_id = ""
+                    stagnant_steps = 0
+                current_date = self._ensure_date_context(
+                    panel, scroller, current_date
                 )
 
-            if added:
-                no_new_streak = 0
+                try:
+                    added, current_date = self.harvest_visible(
+                        panel, messages, current_date
+                    )
+                except StaleElementReferenceException:
+                    panel = self.driver.find_element(By.CSS_SELECTOR, S["panel"])
+                    scroller = PanelScroller(self.driver, panel)
+                    added, current_date = self.harvest_visible(
+                        panel, messages, current_date
+                    )
+
+                if added:
+                    no_new_streak = 0
+                else:
+                    no_new_streak += 1
+
+                if len(messages) == prev_message_count:
+                    stagnant_steps += 1
+                else:
+                    stagnant_steps = 0
+                prev_message_count = len(messages)
+
+                if self.checkpoint_interval and step_n % self.checkpoint_interval == 0:
+                    if self.writer is not None:
+                        self.writer.checkpoint()
+
+                metrics = scroller.metrics()
+                visible_n = metrics.get("visibleCount", 0)
+                oldest_id = metrics.get("oldestId") or ""
+                anchor_id = scroller.topmost_anchor_id(messages, metrics)
+
+                if step_n == 1 or step_n % 15 == 0 or added:
+                    anchor_hint = f", anchor={anchor_id[:12]}…" if anchor_id else ""
+                    log(
+                        f"  ↑ step {step_n}: {len(messages)} total"
+                        f" (+{added} new), visible={visible_n}{anchor_hint}"
+                    )
+
+                # Stop once we have scrolled past the requested --from-date.
+                if self._below_from_date(current_date):
+                    below_from_streak += 1
+                    if below_from_streak >= 3:
+                        log(
+                            f"\n✓  Reached start of requested date range "
+                            f"({self.from_date:%d/%m/%Y}).  "
+                            f"{len(messages)} messages captured this run."
+                        )
+                        break
+                else:
+                    below_from_streak = 0
+
+                older_prompt = (
+                    scroller.has_older_messages_prompt()
+                    if self.scroll_to_chat_start
+                    else False
+                )
+                if PanelScroller.reached_history_top(
+                    metrics,
+                    stall_streak=stall_streak,
+                    scroll_stuck_streak=scroll_stuck_streak,
+                    no_new_streak=no_new_streak,
+                    prev_oldest_id=prev_oldest_id,
+                    has_older_messages_prompt=older_prompt,
+                ):
+                    current_date = self._ensure_date_context(
+                        panel, scroller, current_date
+                    )
+                    self.harvest_visible(panel, messages, current_date)
+                    log(
+                        f"\n✓  Reached the top of history.  "
+                        f"{len(messages)} messages captured."
+                    )
+                    break
+
+                scroll_result = scroller.scroll_up_from_anchor(anchor_id)
+                scrolled = scroll_result.get("scrolled") or 0
+                if scroll_result.get("stuck") or scrolled > 1:
+                    scroll_stuck_streak += 1
+                    scroller.scroll_fallback("up")
+                else:
+                    scroll_stuck_streak = 0
+
+                if stagnant_steps >= 12 and scroll_stuck_streak < 3:
+                    scroller.scroll_chunk(-(140 + (stagnant_steps % 5) * 24))
+
+                metrics = scroller.metrics()
+                oldest_id = metrics.get("oldestId") or oldest_id
+                if oldest_id and oldest_id == prev_oldest_id:
+                    stall_streak += 1
+                else:
+                    stall_streak = 0
+                prev_oldest_id = oldest_id
+
+                jitter(self.scroll_pause * 0.35, self.scroll_pause * 0.75)
             else:
-                no_new_streak += 1
-
-            if len(messages) == prev_message_count:
-                stagnant_steps += 1
-            else:
-                stagnant_steps = 0
-            prev_message_count = len(messages)
-
-            metrics = scroller.metrics()
-            visible_n = metrics.get("visibleCount", 0)
-            oldest_id = metrics.get("oldestId") or ""
-            anchor_id = scroller.topmost_anchor_id(messages, metrics)
-
-            if step_n == 1 or step_n % 15 == 0 or added:
-                anchor_hint = f", anchor={anchor_id[:12]}…" if anchor_id else ""
-                log(
-                    f"  ↑ step {step_n}: {len(messages)} total"
-                    f" (+{added} new), visible={visible_n}{anchor_hint}"
-                )
-
-            older_prompt = (
-                scroller.has_older_messages_prompt()
-                if self.scroll_to_chat_start
-                else False
-            )
-            if PanelScroller.reached_history_top(
-                metrics,
-                stall_streak=stall_streak,
-                scroll_stuck_streak=scroll_stuck_streak,
-                no_new_streak=no_new_streak,
-                prev_oldest_id=prev_oldest_id,
-                has_older_messages_prompt=older_prompt,
-            ):
                 current_date = self._ensure_date_context(
                     panel, scroller, current_date
                 )
                 self.harvest_visible(panel, messages, current_date)
                 log(
-                    f"\n✓  Reached the top of history.  "
-                    f"{len(messages)} messages captured."
+                    f"\n⚠  Stopped after {self.max_top_scrolls} upward scroll "
+                    f"steps.  {len(messages)} messages captured."
                 )
-                break
-
-            scroll_result = scroller.scroll_up_from_anchor(anchor_id)
-            scrolled = scroll_result.get("scrolled") or 0
-            if scroll_result.get("stuck") or scrolled > 1:
-                scroll_stuck_streak += 1
-                scroller.scroll_fallback("up")
-            else:
-                scroll_stuck_streak = 0
-
-            if stagnant_steps >= 12 and scroll_stuck_streak < 3:
-                scroller.scroll_chunk(-(140 + (stagnant_steps % 5) * 24))
-
-            metrics = scroller.metrics()
-            oldest_id = metrics.get("oldestId") or oldest_id
-            if oldest_id and oldest_id == prev_oldest_id:
-                stall_streak += 1
-            else:
-                stall_streak = 0
-            prev_oldest_id = oldest_id
-
-            jitter(self.scroll_pause * 0.35, self.scroll_pause * 0.75)
-        else:
-            current_date = self._ensure_date_context(
-                panel, scroller, current_date
-            )
-            self.harvest_visible(panel, messages, current_date)
-            log(
-                f"\n⚠  Stopped after {self.max_top_scrolls} upward scroll steps.  "
-                f"{len(messages)} messages captured."
-            )
+        finally:
+            # Always flush captured messages — on clean finish, on a break, or
+            # on an exception / KeyboardInterrupt — so no data is ever lost.
+            if self.writer is not None:
+                self.writer.close()
 
         ordered = self._sort_messages(messages)
         self._fill_grouped_senders(ordered)

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
+from wa_scraper.merge import merge_shards
 from wa_scraper.scraper import ScraperConfig, WhatsAppScraper
 from wa_scraper.utils import log
 
@@ -76,6 +75,9 @@ Usage
   python whatsapp_scraper.py --group "Team Chat" --output team.json
   python whatsapp_scraper.py --group "Team Chat" --scroll-pause 1.5
   python whatsapp_scraper.py --group "Team Chat" --scroll-to-chat-start
+  python whatsapp_scraper.py --group "Team Chat" --from-date 01/01/2025
+  python whatsapp_scraper.py --group "Team Chat" --to-date 30/06/2025
+  python whatsapp_scraper.py --output team.json --merge-only
 
 Notes
 ─────
@@ -91,6 +93,14 @@ Notes
   • Use --scroll-to-chat-start to reach the very beginning of a chat; the
     scraper clicks WhatsApp's "load older messages from your phone" card when
     it appears and keeps harvesting after the sync finishes.
+  • Messages are streamed to crash-safe shard files (<stem>.partNNN<suffix>)
+    that are flushed periodically and on error/interrupt, so no data is lost.
+    Each shard is capped at --shard-size messages. Re-running resumes by
+    default (already-captured ids are skipped); use --no-resume to disable.
+  • Restart a fallen run "by date": pass --to-date with the oldest date you
+    already captured (and optionally --from-date) to scrape only that window.
+  • Use --merge-after (after a run) or --merge-only to combine all shards into
+    a single, globally-sorted file at --output.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -103,8 +113,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--group",
-        required=True,
-        help="Group name to scrape (partial/case-insensitive match).",
+        default=None,
+        help="Group name to scrape (partial/case-insensitive match). "
+        "Required unless --merge-only is used.",
     )
     ap.add_argument(
         "--output",
@@ -136,12 +147,78 @@ def main() -> None:
             "'load older messages from your phone' prompt when it appears."
         ),
     )
+    ap.add_argument(
+        "--shard-size",
+        type=int,
+        default=5000,
+        help=(
+            "Max messages per output shard file before a new one is started "
+            "(default: 5000). Shards are named <stem>.partNNN<suffix>."
+        ),
+    )
+    ap.add_argument(
+        "--from-date",
+        default=None,
+        help=(
+            "Only capture messages on/after this date (dd/mm/yyyy or "
+            "yyyy-mm-dd). Scrolling stops once older messages are reached."
+        ),
+    )
+    ap.add_argument(
+        "--to-date",
+        default=None,
+        help=(
+            "Only capture messages on/before this date (dd/mm/yyyy or "
+            "yyyy-mm-dd). Useful to restart a fallen run from where it stopped."
+        ),
+    )
+    ap.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help=(
+            "Do not load existing shards; start numbering fresh (may overwrite "
+            "and re-capture). Resume is enabled by default."
+        ),
+    )
+    ap.set_defaults(resume=True)
+    ap.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=50,
+        help=(
+            "Scroll steps between atomic checkpoints of the in-progress shard "
+            "(default: 50)."
+        ),
+    )
+    ap.add_argument(
+        "--merge-after",
+        action="store_true",
+        help=(
+            "After a clean run, merge all shards into a single sorted file at "
+            "--output."
+        ),
+    )
+    ap.add_argument(
+        "--merge-only",
+        action="store_true",
+        help=(
+            "Skip scraping; merge existing shards into --output and exit."
+        ),
+    )
     args = ap.parse_args()
 
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, OSError):
         pass
+
+    if args.merge_only:
+        merge_shards(args.output)
+        return
+
+    if not args.group:
+        ap.error("--group is required unless --merge-only is used.")
 
     config = ScraperConfig(
         group=args.group,
@@ -150,16 +227,20 @@ def main() -> None:
         scroll_pause=args.scroll_pause,
         max_top_scrolls=args.max_top_scrolls,
         scroll_to_chat_start=args.scroll_to_chat_start,
+        shard_size=args.shard_size,
+        from_date=args.from_date,
+        to_date=args.to_date,
+        resume=args.resume,
+        checkpoint_interval=args.checkpoint_interval,
     )
 
     scraper = WhatsAppScraper(config)
     messages = scraper.scrape()
 
-    output_path = Path(config.output)
-    payload = [asdict(m) for m in messages]
-    output_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    log(
+        f"✓  Saved {len(messages)} messages this run to shards "
+        f"alongside {Path(config.output).name}"
     )
 
-    log(f"✓  Saved {len(messages)} messages → {output_path}")
+    if args.merge_after:
+        merge_shards(config.output)
