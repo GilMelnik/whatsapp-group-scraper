@@ -718,6 +718,7 @@ return (function(panel) {
 
 _JS_OLDER_MESSAGES_HELPERS = r"""
 function _waOlderMessagesPatterns() {
+    // The normal "load older messages from phone" prompt.
     return [
         /click here to get older messages/i,
         /use whatsapp on your phone to see older/i,
@@ -728,21 +729,86 @@ function _waOlderMessagesPatterns() {
         /הודעות צ'אט ישנות/i
     ];
 }
+function _waOlderMessagesRetryPatterns() {
+    // The phone-sync *error* prompt: "Couldn't get older messages. Open
+    // WhatsApp on your phone and click here to try again." (+ Hebrew variants).
+    return [
+        /couldn.?t get older messages/i,
+        /could not get older messages/i,
+        /click here to try again/i,
+        /open whatsapp on your phone/i,
+        /לא הצלחנו לקבל הודעות/i,
+        /לקבל הודעות ישנות יותר/i,
+        /לחצו כאן כדי לנסות שוב/i,
+        /לנסות שוב/i,
+        /נסו שוב/i
+    ];
+}
+function _waMatchesAny(text, patterns) {
+    for (var p = 0; p < patterns.length; p++) {
+        if (patterns[p].test(text)) return true;
+    }
+    return false;
+}
+function _waCleanPromptText(el) {
+    return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+}
 function _waOlderMessagesButton(panel) {
     if (!panel) return null;
-    var patterns = _waOlderMessagesPatterns();
-    var candidates = panel.querySelectorAll('button');
-    for (var i = 0; i < candidates.length; i++) {
-        var el = candidates[i];
-        var text = (el.innerText || el.textContent || '')
-            .replace(/\s+/g, ' ')
-            .trim();
+    var loadPats = _waOlderMessagesPatterns();
+    var retryPats = _waOlderMessagesRetryPatterns();
+
+    // 1) The normal prompt renders as a real <button>.
+    var buttons = panel.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) {
+        var text = _waCleanPromptText(buttons[i]);
         if (!text) continue;
-        for (var p = 0; p < patterns.length; p++) {
-            if (patterns[p].test(text)) return el;
+        if (_waMatchesAny(text, loadPats) || _waMatchesAny(text, retryPats)) {
+            return buttons[i];
         }
     }
+
+    // 2) The sync error/retry prompt renders as a non-button element. Find the
+    //    smallest matching system element (not a chat message) and return its
+    //    clickable node.
+    var nodes = panel.querySelectorAll('div[role="button"], [role="button"], a, span, div');
+    var best = null;
+    var bestLen = Infinity;
+    for (var n = 0; n < nodes.length; n++) {
+        var node = nodes[n];
+        if (node.closest('[data-id]')) continue;   // skip chat message rows
+        var t = _waCleanPromptText(node);
+        if (!t || t.length > 200) continue;
+        if (!_waMatchesAny(t, loadPats) && !_waMatchesAny(t, retryPats)) continue;
+        if (t.length < bestLen) {
+            bestLen = t.length;
+            best = node;
+        }
+    }
+    if (best) {
+        var clickable = best.querySelector('button, [role="button"], a[href], a, span[role="button"]');
+        return clickable || best;
+    }
     return null;
+}
+function _waOlderMessagesPromptKind(panel) {
+    if (!panel) return '';
+    var loadPats = _waOlderMessagesPatterns();
+    var retryPats = _waOlderMessagesRetryPatterns();
+    var nodes = panel.querySelectorAll('button, div[role="button"], [role="button"], a, span, div');
+    var sawRetry = false;
+    var sawLoad = false;
+    for (var n = 0; n < nodes.length; n++) {
+        var node = nodes[n];
+        if (node.closest('[data-id]')) continue;
+        var t = _waCleanPromptText(node);
+        if (!t || t.length > 200) continue;
+        if (_waMatchesAny(t, retryPats)) sawRetry = true;
+        else if (_waMatchesAny(t, loadPats)) sawLoad = true;
+    }
+    if (sawRetry) return 'retry';
+    if (sawLoad) return 'load';
+    return '';
 }
 """
 
@@ -750,6 +816,13 @@ _JS_HAS_OLDER_MESSAGES_PROMPT = (
     _JS_OLDER_MESSAGES_HELPERS
     + r"""
 return !!_waOlderMessagesButton(arguments[0]);
+"""
+)
+
+_JS_OLDER_MESSAGES_PROMPT_KIND = (
+    _JS_OLDER_MESSAGES_HELPERS
+    + r"""
+return _waOlderMessagesPromptKind(arguments[0]);
 """
 )
 

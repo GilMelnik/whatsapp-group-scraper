@@ -9,6 +9,7 @@ from selenium.common.exceptions import StaleElementReferenceException
 from wa_scraper.js.scroll import (
     _JS_CLICK_OLDER_MESSAGES_PROMPT,
     _JS_HAS_OLDER_MESSAGES_PROMPT,
+    _JS_OLDER_MESSAGES_PROMPT_KIND,
     _JS_PANEL_METRICS,
     _JS_PANEL_SCROLL_UP,
     _JS_SCROLL_HELPERS,
@@ -40,6 +41,18 @@ class PanelScroller:
             )
         except Exception:
             return False
+
+    def older_messages_prompt_kind(self) -> str:
+        """Return 'load', 'retry', or '' for the phone-sync prompt currently shown."""
+        try:
+            result = self.driver.execute_script(
+                _JS_OLDER_MESSAGES_PROMPT_KIND, self.panel
+            )
+            if isinstance(result, str):
+                return result
+        except Exception:
+            pass
+        return ""
 
     def click_older_messages_prompt(self) -> bool:
         try:

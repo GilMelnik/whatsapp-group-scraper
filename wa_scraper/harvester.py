@@ -136,17 +136,63 @@ class MessageHarvester:
 
         return self._find_date_above(panel) or current_date
 
-    def _try_load_older_from_phone(self, panel, scroller) -> bool:
-        """Click WhatsApp's phone-sync prompt and wait for older messages."""
-        if not self.scroll_to_chat_start:
-            return False
-        if not scroller.click_older_messages_prompt():
-            return False
+    def _try_load_older_from_phone(self, panel, scroller) -> str:
+        """Click WhatsApp's phone-sync prompt and wait for older messages.
 
-        log("  ↻  Clicked 'load older messages from phone' — waiting …")
-        scroller.wait_no_spinner(timeout=45.0)
-        jitter(0.8, 1.6)
-        return True
+        Returns the kind of prompt that was clicked: 'load' for the normal
+        "load older messages from phone" prompt, 'retry' for the
+        "Couldn't get older messages … click here to try again" error prompt,
+        or '' if no prompt was clicked.
+        """
+        if not self.scroll_to_chat_start:
+            return ""
+        kind = scroller.older_messages_prompt_kind()
+        if not scroller.click_older_messages_prompt():
+            return ""
+
+        if kind == "retry":
+            log("  ⟳  Phone-sync error — clicked 'try again' …")
+            # Give the phone extra time to re-deliver after a sync failure.
+            scroller.wait_no_spinner(timeout=45.0)
+            jitter(1.5, 3.0)
+        else:
+            log("  ↻  Clicked 'load older messages from phone' — waiting …")
+            scroller.wait_no_spinner(timeout=45.0)
+            jitter(0.8, 1.6)
+        return kind or "load"
+
+    def _reacquire_panel(self):
+        """Re-locate the conversation panel after WhatsApp re-renders the DOM.
+
+        WhatsApp periodically rebuilds the message-list container while loading
+        large history chunks, which detaches the cached ``panel`` element and
+        makes every subsequent JS call raise ``StaleElementReferenceException``.
+        Re-finding the panel and rebuilding the scroller recovers from this.
+        """
+        panel = self.driver.find_element(By.CSS_SELECTOR, S["panel"])
+        scroller = PanelScroller(self.driver, panel)
+        try:
+            self.driver.execute_script(
+                "delete arguments[0].dataset.waReversed;", panel
+            )
+        except Exception:
+            pass
+        return panel, scroller
+
+    def _nudge_to_trigger_phone_load(self, panel, scroller) -> None:
+        """Scroll down then back up to retrigger WhatsApp's lazy loader.
+
+        At the boundary of locally-loaded history, clicking the "load older
+        messages from phone" prompt does not fetch anything until a real scroll
+        gesture happens. This mimics a manual "scroll down a bit, then back up"
+        so the loader sentinel leaves and re-enters the viewport.
+        """
+        log("  ↕  Nudging scroll to retrigger phone load …")
+        scroller.scroll_chunk(700)   # down (toward newer)
+        jitter(0.5, 0.9)
+        scroller.scroll_chunk(-900)  # back up past the boundary
+        scroller.wait_no_spinner(timeout=30.0)
+        jitter(0.8, 1.5)
 
     def _ordered_panel_rows(self, panel) -> List:
         rows: List = []
@@ -361,6 +407,12 @@ class MessageHarvester:
 
         messages: Dict[str, Message] = {}
         current_date = self._ensure_date_context(panel, scroller, "")
+
+        # Capture the initial (newest) viewport now, before the loop's first
+        # "load older messages from phone" click can scroll the panel away from
+        # the bottom of the chat (otherwise the newest messages are never seen).
+        _, current_date = self.harvest_visible(panel, messages, current_date)
+
         no_new_streak = 0
         stall_streak = 0
         scroll_stuck_streak = 0
@@ -369,16 +421,21 @@ class MessageHarvester:
         prev_message_count = 0
         stagnant_steps = 0
         below_from_streak = 0
+        sync_retry_streak = 0
+        load_stall_streak = 0
+        stale_reacquire_streak = 0
 
         try:
             for step_n in range(1, self.max_top_scrolls + 1):
                 scroller.wait_no_spinner()
+
                 if self._try_load_older_from_phone(panel, scroller):
                     no_new_streak = 0
                     stall_streak = 0
                     scroll_stuck_streak = 0
                     prev_oldest_id = ""
                     stagnant_steps = 0
+
                 current_date = self._ensure_date_context(
                     panel, scroller, current_date
                 )
@@ -410,6 +467,28 @@ class MessageHarvester:
                         self.writer.checkpoint()
 
                 metrics = scroller.metrics()
+
+                # Empty metrics mean the panel element went stale (WhatsApp
+                # re-rendered the message list). Re-acquire it and retry the
+                # step, otherwise every JS call silently no-ops forever.
+                if not metrics:
+                    stale_reacquire_streak += 1
+                    if stale_reacquire_streak >= 12:
+                        log(
+                            "\n⚠  Lost the conversation panel (DOM kept "
+                            f"re-rendering).  {len(messages)} messages captured. "
+                            "Re-run to resume."
+                        )
+                        break
+                    try:
+                        panel, scroller = self._reacquire_panel()
+                    except Exception:
+                        pass
+                    jitter(0.5, 1.0)
+                    continue
+                else:
+                    stale_reacquire_streak = 0
+
                 visible_n = metrics.get("visibleCount", 0)
                 oldest_id = metrics.get("oldestId") or ""
                 anchor_id = scroller.topmost_anchor_id(messages, metrics)
@@ -434,11 +513,65 @@ class MessageHarvester:
                 else:
                     below_from_streak = 0
 
-                older_prompt = (
-                    scroller.has_older_messages_prompt()
+                prompt_kind = (
+                    scroller.older_messages_prompt_kind()
                     if self.scroll_to_chat_start
-                    else False
+                    else ""
                 )
+                older_prompt = bool(prompt_kind)
+
+                # A persistent "Couldn't get older messages … try again" error
+                # that never yields new messages means the phone is unreachable;
+                # bail out cleanly instead of retrying forever.
+                if prompt_kind == "retry" and added == 0:
+                    sync_retry_streak += 1
+                else:
+                    sync_retry_streak = 0
+
+                if sync_retry_streak >= 30:
+                    self.harvest_visible(panel, messages, current_date)
+                    log(
+                        "\n⚠  Phone sync kept failing ('Couldn't get older "
+                        f"messages').  {len(messages)} messages captured.  "
+                        "Make sure WhatsApp is open and online on your phone, "
+                        "then re-run to resume from where this stopped."
+                    )
+                    break
+
+                # At the local-history boundary the normal "load older messages
+                # from phone" prompt can persist while clicking it no longer
+                # fetches anything (it only fires on a real scroll gesture).
+                # Detect that stall and nudge the panel to retrigger the loader.
+                if prompt_kind == "load" and added == 0:
+                    load_stall_streak += 1
+                else:
+                    load_stall_streak = 0
+
+                if load_stall_streak and load_stall_streak % 3 == 0:
+                    self._nudge_to_trigger_phone_load(panel, scroller)
+                    current_date = self._ensure_date_context(
+                        panel, scroller, current_date
+                    )
+                    nudged_added, current_date = self.harvest_visible(
+                        panel, messages, current_date
+                    )
+
+                    if nudged_added:
+                        added += nudged_added
+                        load_stall_streak = 0
+                        no_new_streak = 0
+
+                if load_stall_streak >= 30:
+                    self.harvest_visible(panel, messages, current_date)
+                    log(
+                        f"\n⚠  WhatsApp will not load messages older than "
+                        f"{current_date} into this linked device "
+                        f"('Use WhatsApp on your phone to see older messages').  "
+                        f"{len(messages)} messages captured — this is the limit "
+                        "of the history WhatsApp Web syncs from your phone."
+                    )
+                    break
+
                 if PanelScroller.reached_history_top(
                     metrics,
                     stall_streak=stall_streak,

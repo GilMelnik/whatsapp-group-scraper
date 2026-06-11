@@ -37,6 +37,10 @@ class ShardWriter:
         resume: bool = True,
     ) -> None:
         self.base = Path(base_output)
+        if self.base.suffix == '':
+            self.base.mkdir(parents=True, exist_ok=True)
+        else:
+            self.base.parent.mkdir(parents=True, exist_ok=True)
         self.shard_size = max(1, int(shard_size))
         self.buffer: List[Message] = []
         self.seen_written: Set[str] = set()
@@ -162,6 +166,7 @@ class ShardWriter:
 
     def _write_atomic(self, path: Path, msgs: List[Message]) -> None:
         payload = [asdict(m) for m in msgs]
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
