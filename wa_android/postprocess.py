@@ -9,14 +9,14 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Iterable, List, Optional
 
-from wa_scraper.contact import Contact
-from wa_scraper.models import Message
+from wa_android.contact import Contact
+from wa_android.models import Message
 
 
 def sort_messages(values: Iterable[Message]) -> List[Message]:
     """Return messages ordered chronologically by date + time, then id."""
 
-    def sort_key(msg: Message):
+    def sort_key(msg: Message) -> tuple[int, float, str]:
         for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
             try:
                 ts = datetime.strptime(f"{msg.date} {msg.time}", fmt).timestamp()

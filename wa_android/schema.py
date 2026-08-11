@@ -1,4 +1,4 @@
-"""WhatsApp msgstore.db schema detection and metadata."""
+"""Modern WhatsApp msgstore.db schema detection and metadata (crypt15)."""
 
 from __future__ import annotations
 
@@ -9,9 +9,7 @@ from typing import Dict, List, Optional, Set
 
 @dataclass(frozen=True)
 class SchemaInfo:
-    variant: str  # "modern" | "legacy"
     tables: Set[str]
-    message_table: str
     has_message_quoted: bool
     has_message_add_on: bool
     has_chat: bool
@@ -25,37 +23,20 @@ def _table_names(conn: sqlite3.Connection) -> Set[str]:
     return {row[0] for row in rows}
 
 
-def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
-    try:
-        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    except sqlite3.Error:
-        return []
-    return [row[1] for row in rows]
-
-
 def detect_schema(conn: sqlite3.Connection) -> SchemaInfo:
     tables = _table_names(conn)
-    if "message" in tables:
-        return SchemaInfo(
-            variant="modern",
-            tables=tables,
-            message_table="message",
-            has_message_quoted="message_quoted" in tables,
-            has_message_add_on="message_add_on" in tables,
-            has_chat="chat" in tables,
-            has_jid="jid" in tables,
+    if "message" not in tables:
+        raise ValueError(
+            "Unrecognized WhatsApp database schema (no 'message' table). "
+            "Only modern crypt15 msgstore databases are supported."
         )
-    if "messages" in tables:
-        return SchemaInfo(
-            variant="legacy",
-            tables=tables,
-            message_table="messages",
-            has_message_quoted=False,
-            has_message_add_on=False,
-            has_chat="chat_list" in tables,
-            has_jid=False,
-        )
-    raise ValueError("Unrecognized WhatsApp database schema (no message table).")
+    return SchemaInfo(
+        tables=tables,
+        has_message_quoted="message_quoted" in tables,
+        has_message_add_on="message_add_on" in tables,
+        has_chat="chat" in tables,
+        has_jid="jid" in tables,
+    )
 
 
 def attach_wa_db(conn: sqlite3.Connection, wa_db_path: Optional[str]) -> bool:
@@ -72,7 +53,7 @@ def attach_wa_db(conn: sqlite3.Connection, wa_db_path: Optional[str]) -> bool:
         return False
 
 
-# message_type → media_type (modern + legacy media_wa_type)
+# message_type -> media_type
 MEDIA_TYPE_MAP: Dict[int, Optional[str]] = {
     0: None,
     1: "image",

@@ -1,5 +1,3 @@
-selenium
-undetected-chromedriver
 pycryptodome
 wa-crypt-tools
 protobuf>=3.20,<6

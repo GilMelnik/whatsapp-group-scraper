@@ -1,4 +1,4 @@
-"""Parse WhatsApp msgstore.db rows into wa_scraper Message models."""
+"""Parse WhatsApp msgstore.db rows into Message models."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from wa_scraper.contact import Contact, clean_contact_name, dedupe_contacts
-from wa_scraper.models import Message, Quote, Reaction
-from wa_scraper.postprocess import fill_grouped_senders, sort_messages
+from wa_android.contact import Contact, clean_contact_name, dedupe_contacts
+from wa_android.models import Message, Quote, Reaction
+from wa_android.postprocess import fill_grouped_senders, sort_messages
 
 from wa_android.schema import (
     attach_wa_db,
@@ -86,7 +86,7 @@ class GroupDatabaseParser:
     def __enter__(self) -> "GroupDatabaseParser":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: object) -> None:
         self.close()
 
     def _load_contact_names(self) -> Dict[str, str]:
@@ -132,7 +132,7 @@ class GroupDatabaseParser:
     def list_groups(self) -> List[Tuple[str, str]]:
         """Return (display_name, jid) for group chats."""
         groups: List[Tuple[str, str]] = []
-        if self.schema.variant == "modern" and self.schema.has_chat and self.schema.has_jid:
+        if self.schema.has_chat and self.schema.has_jid:
             jid_expr = self._jid_expr("j")
             sql = f"""
                 SELECT {jid_expr} AS jid,
@@ -146,17 +146,6 @@ class GroupDatabaseParser:
                 jid = str(row["jid"] or "")
                 subject = clean_contact_name(str(row["subject"] or ""))
                 display = subject or self._names.get(jid, jid)
-                groups.append((display, jid))
-        elif self.schema.variant == "legacy":
-            sql = """
-                SELECT key_remote_jid AS jid
-                FROM messages
-                WHERE key_remote_jid LIKE '%@g.us'
-                GROUP BY key_remote_jid
-            """
-            for row in self._conn.execute(sql):
-                jid = str(row["jid"] or "")
-                display = self._names.get(jid, jid)
                 groups.append((display, jid))
         return groups
 
@@ -331,57 +320,9 @@ class GroupDatabaseParser:
                 link_preview=None,
             )
 
-    def _iter_legacy_messages(self, group_jid: str) -> Iterable[Message]:
-        sql = """
-            SELECT key_id,
-                   key_from_me,
-                   data,
-                   timestamp,
-                   media_wa_type,
-                   remote_resource,
-                   status
-            FROM messages
-            WHERE key_remote_jid = ?
-            ORDER BY timestamp ASC
-        """
-        for row in self._conn.execute(sql, (group_jid,)):
-            msg_type = row["media_wa_type"]
-            status = row["status"]
-            if is_system_message(msg_type, status):
-                continue
-            text = str(row["data"] or "")
-            is_deleted = is_deleted_message(msg_type)
-            if is_deleted:
-                text = ""
-            is_out = bool(row["key_from_me"])
-            if is_out:
-                sender = Contact(user_name="You", phone=None)
-            else:
-                sender = _contact_from_jid(
-                    str(row["remote_resource"] or ""), self._names
-                )
-            date_s, time_s = _timestamp_parts(row["timestamp"])
-            yield Message(
-                id=str(row["key_id"] or ""),
-                date=date_s,
-                time=time_s,
-                sender=sender,
-                text=text,
-                is_outgoing=is_out,
-                quote=None,
-                reactions=[],
-                media_type=map_media_type(msg_type, text),
-                is_forwarded=False,
-                is_deleted=is_deleted,
-                link_preview=None,
-            )
-
     def iter_messages(self, group_name: str) -> List[Message]:
         group_jid = self.resolve_group(group_name)
-        if self.schema.variant == "modern":
-            messages = list(self._iter_modern_messages(group_jid))
-        else:
-            messages = list(self._iter_legacy_messages(group_jid))
+        messages = list(self._iter_modern_messages(group_jid))
         ordered = sort_messages(messages)
         fill_grouped_senders(ordered)
         return ordered

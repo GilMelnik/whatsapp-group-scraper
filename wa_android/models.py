@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from wa_scraper.contact import Contact
+from wa_android.contact import Contact
 
 Reactor = Contact
 
