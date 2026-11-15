@@ -1,31 +1,15 @@
-"""Shared message ordering, sender-fill, and date parsing helpers.
+"""Sender-fill and date parsing helpers.
 
-These functions are used both by the live harvester (per shard) and by the
-merge helper (globally), so they live here to avoid duplication.
+Messages are never re-sorted here: the parser yields them in the database's order.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 from wa_android.contact import Contact
 from wa_android.models import Message
-
-
-def sort_messages(values: Iterable[Message]) -> List[Message]:
-    """Return messages ordered chronologically by date + time, then id."""
-
-    def sort_key(msg: Message) -> tuple[int, float, str]:
-        for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
-            try:
-                ts = datetime.strptime(f"{msg.date} {msg.time}", fmt).timestamp()
-                return (0, ts, msg.id)
-            except ValueError:
-                continue
-        return (1, 0.0, msg.id)
-
-    return sorted(values, key=sort_key)
 
 
 def fill_grouped_senders(

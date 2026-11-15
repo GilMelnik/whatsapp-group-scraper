@@ -39,20 +39,6 @@ def detect_schema(conn: sqlite3.Connection) -> SchemaInfo:
     )
 
 
-def attach_wa_db(conn: sqlite3.Connection, wa_db_path: Optional[str]) -> bool:
-    if not wa_db_path:
-        return False
-    try:
-        conn.execute("DETACH DATABASE wa")
-    except sqlite3.Error:
-        pass
-    try:
-        conn.execute("ATTACH DATABASE ? AS wa", (wa_db_path,))
-        return True
-    except sqlite3.Error:
-        return False
-
-
 # message_type -> media_type
 MEDIA_TYPE_MAP: Dict[int, Optional[str]] = {
     0: None,

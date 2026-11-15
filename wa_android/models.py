@@ -23,6 +23,12 @@ class Quote:
 
 
 @dataclass
+class Mention:
+    tag:    str  # the digits of "@<digits>" as they stand in the text
+    member: str  # the tagged member's id (wa_android.members)
+
+
+@dataclass
 class LinkPreview:
     url:         str = ""
     title:       str = ""
@@ -43,4 +49,5 @@ class Message:
     is_forwarded: bool                  = False
     is_deleted:   bool                  = False
     link_preview: Optional[LinkPreview] = None
+    mentions:     List[Mention]         = field(default_factory=list)
 

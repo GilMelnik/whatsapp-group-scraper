@@ -219,3 +219,6 @@ __marimo__/
 
 # WhatsApp scraper: local DOM capture artifacts (may contain chat content)
 captures/
+
+# Decrypted databases, keys and exports (private)
+outputs/

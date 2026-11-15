@@ -24,14 +24,23 @@ On the phone (once):
 
 Copy off the phone (USB/MTP or a file manager):
   Android/media/com.whatsapp/WhatsApp/Databases/msgstore.db.crypt15
-  (optionally wa.db for readable contact names)
+  (a plain, already decrypted msgstore.db is accepted too)
 
 Usage
 ─────
   python whatsapp_android_export.py \\
-      --db msgstore.db.crypt15 --wa-db wa.db \\
+      --db msgstore.db.crypt15 \\
       --group "My Group" --backup-key <64-hex> \\
-      --output chat_android.json
+      --members members.json --output chat_android.json
+
+Output
+──────
+  A JSON list of messages in the database's order (time, then row id; never
+  re-sorted). "time" is HH:MM:SS. A sender (also a quoted sender, a reactor and a
+  tagged member) is its member id: the member's phone id when the database knows
+  it, else its lid id, the same throughout the chat history; your own are "You".
+  "mentions" lists the tags of the text: [{"tag": "<digits>", "member": "<id>"}].
+  --members keeps the ids constant across backups (ids only, no names).
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -60,7 +69,10 @@ def main() -> None:
     ap.add_argument(
         "--wa-db",
         default=None,
-        help="Path to wa.db contacts database (optional, for readable names).",
+        help=(
+            "Not used any more (senders are member ids from msgstore.db); accepted so "
+            "older command lines still run."
+        ),
     )
     ap.add_argument(
         "--backup-key",
@@ -81,6 +93,15 @@ def main() -> None:
         default=None,
         help="Only export messages on/before this date (dd/mm/yyyy or yyyy-mm-dd).",
     )
+    ap.add_argument(
+        "--members",
+        default=None,
+        help=(
+            "Members file (JSON, ids only): read when it exists and written back "
+            "extended, so every member keeps one id across backups. Without it the "
+            "ids come from this backup alone."
+        ),
+    )
     args = ap.parse_args()
 
     try:
@@ -92,9 +113,9 @@ def main() -> None:
         group=args.group,
         db=args.db,
         output=args.output,
-        wa_db=args.wa_db,
         backup_key=args.backup_key,
         from_date=args.from_date,
         to_date=args.to_date,
+        members=args.members,
     )
     export_group(config)
